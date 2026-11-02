@@ -1,15 +1,46 @@
 # FluxBridge Android capture server
 
-A headless Kotlin program that runs **on the Android device** and streams its
-screen to the FluxBridge desktop client while injecting remote input. It is the
-device-side half of the FluxBridge link; the PC-side half lives in
+> ## v1 decision: FluxBridge drives the upstream scrcpy server
+>
+> **For v1, FluxBridge does NOT ship the Kotlin server in this directory.**
+> Instead it drives the upstream, MIT-licensed
+> [`scrcpy-server`](https://github.com/Genymobile/scrcpy) jar: the jar is pushed
+> to `/data/local/tmp/scrcpy-server.jar` and launched with `app_process` under
+> the shell UID, exactly as scrcpy itself does. This gives FluxBridge a mature,
+> battle-tested H.264 capture + input-injection server on day one instead of a
+> half-finished bespoke one.
+>
+> * **Targeted scrcpy server version:** `2.4` (see `SCRCPY_SERVER_VERSION` in
+>   `crates/desktop/src/adb.rs`). The desktop client passes this version string
+>   to `com.genymobile.scrcpy.Server`; the pushed jar must match.
+> * **Where the jar comes from:** it is obtained and bundled on the **Windows
+>   packaging side** (the Inno Setup installer ships it next to the .exe). The
+>   `.jar` binary is deliberately **NOT vendored into this repository** and is
+>   not part of the Rust workspace build. License compliance: scrcpy is MIT; its
+>   license is reproduced alongside the bundled jar in the Windows package.
+> * **Sockets are scrcpy framing, not FluxBridge 0xFB.** The scrcpy video and
+>   control sockets (exposed on `localabstract:scrcpy`) use scrcpy's own wire
+>   format, parsed/encoded in `crates/desktop/src/scrcpy.rs`. The FluxBridge
+>   `0xFB` [`PacketCodec`] protocol in `crates/core/src/protocol.rs` is retained
+>   for a future FluxBridge-native server but is **not** used on scrcpy sockets.
+>
+> ## This Kotlin skeleton is reference-only
+>
+> The `Server.kt` below is **retained purely as documentation** of the
+> equivalent `app_process` capture/inject technique (and of the FluxBridge-native
+> 0xFB protocol). **It is not the shipped v1 server** and is not compiled by the
+> Rust workspace or CI. If a FluxBridge-native server is ever built out, this is
+> the starting point; until then, scrcpy is the server.
+
+The rest of this document describes the device-side half of the FluxBridge link
+(whether scrcpy or, eventually, this skeleton); the PC-side half lives in
 `crates/desktop`.
 
-> Status: **skeleton**. The protocol framing and the server accept/dispatch loop
-> are real; the framework calls (SurfaceControl, MediaCodec, InputManager,
+> Status of this skeleton: the protocol framing and the server accept/dispatch
+> loop are real; the framework calls (SurfaceControl, MediaCodec, InputManager,
 > DisplayManager) are documented stubs. This module is intentionally **not**
 > compiled by the Rust workspace or the CI sandbox (there is no Android SDK
-> there). It is built out of band with the Android toolchain.
+> there). It would be built out of band with the Android toolchain.
 
 ## Why `app_process` and not an APK
 

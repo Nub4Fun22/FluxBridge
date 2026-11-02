@@ -1,10 +1,15 @@
 /*
- * FluxBridge Android capture server (SKELETON).
+ * FluxBridge Android capture server (SKELETON, REFERENCE-ONLY).
  *
- * This file is a documented, well-formed Kotlin skeleton. It is NOT compiled in
- * the FluxBridge CI sandbox (there is no Android SDK there); it is built out of
- * band with the Android toolchain (see android-server/README.md) and shipped to
- * the device as a plain .jar / .dex that is launched over adb with app_process:
+ * NOT THE SHIPPED v1 SERVER. FluxBridge v1 drives the upstream MIT-licensed
+ * scrcpy-server jar (pushed to /data/local/tmp and launched via app_process);
+ * see android-server/README.md and crates/desktop/src/adb.rs for that decision.
+ * This file is retained ONLY as documentation of the equivalent app_process
+ * capture/inject technique and of the FluxBridge-native 0xFB protocol. It is a
+ * documented, well-formed Kotlin skeleton that is NOT compiled in the FluxBridge
+ * CI sandbox (there is no Android SDK there). If it were ever built, it would be
+ * built out of band with the Android toolchain and shipped to the device as a
+ * plain .jar / .dex launched over adb with app_process:
  *
  *     adb push fluxbridge-server.jar /data/local/tmp/
  *     adb shell CLASSPATH=/data/local/tmp/fluxbridge-server.jar \

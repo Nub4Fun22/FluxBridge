@@ -5,6 +5,14 @@ members = [
     "crates/updater",
     "crates/desktop",
 ]
+# The icon-generation helper is a developer-only tool. It is EXCLUDED from the
+# workspace so its heavy pure-Rust rendering dependencies (resvg/usvg/
+# tiny-skia/ico) are never pulled into `cargo build --workspace`, the `gui`
+# build, or the shipped desktop binary. Run it on demand with
+# `cargo run --manifest-path xtask/Cargo.toml -- icon` (see README.md).
+exclude = [
+    "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"

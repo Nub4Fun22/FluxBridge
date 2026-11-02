@@ -51,6 +51,37 @@ pub enum UpdateEvent {
     Failed(String),
 }
 
+/// Map an [`UpdateEvent`] to a short, user-facing status line.
+///
+/// This is the single source of truth for the text the Start-menu "Check for
+/// updates" flow shows, kept here (feature-independent) so it can be unit-tested
+/// on the headless host without any Slint dependency. The GUI layer only reads
+/// the returned string and decides where to display it.
+///
+/// Returns `None` for events that drive a dedicated UI surface instead of the
+/// status line ([`UpdateEvent::Available`] opens the dialog;
+/// [`UpdateEvent::Applied`] quits the event loop), so the caller can skip
+/// overwriting the status line in those cases.
+pub fn update_event_status(event: &UpdateEvent) -> Option<String> {
+    match event {
+        UpdateEvent::Available(info) => {
+            Some(format!("Update available: {}", info.version))
+        }
+        UpdateEvent::UpToDate => Some("You are on the latest version".to_string()),
+        UpdateEvent::Progress(pct) => Some(format!("Downloading update: {pct}%")),
+        UpdateEvent::Applied(_) => None,
+        UpdateEvent::DownloadedManual(path) => {
+            Some(format!("Downloaded to {path}. Please apply the update manually."))
+        }
+        UpdateEvent::Failed(msg) => Some(format!("Update check failed: {msg}")),
+    }
+}
+
+/// Whether an [`UpdateEvent`]'s status line should be styled as an error.
+pub fn update_event_is_error(event: &UpdateEvent) -> bool {
+    matches!(event, UpdateEvent::Failed(_))
+}
+
 /// Run the update check synchronously and return the outcome.
 ///
 /// Separated from threading so it can be unit-tested with a fake transport.
@@ -167,6 +198,38 @@ mod tests {
         format!(
             r#"{{"tag_name":"{tag}","body":"notes","draft":false,"assets":[{{"name":"app.exe","browser_download_url":"https://example.com/app.exe"}}]}}"#
         )
+    }
+
+    #[test]
+    fn up_to_date_maps_to_visible_latest_version_status() {
+        let status = update_event_status(&UpdateEvent::UpToDate);
+        assert_eq!(status.as_deref(), Some("You are on the latest version"));
+        assert!(!update_event_is_error(&UpdateEvent::UpToDate));
+    }
+
+    #[test]
+    fn failed_maps_to_error_status() {
+        let event = UpdateEvent::Failed("network down".into());
+        assert_eq!(
+            update_event_status(&event).as_deref(),
+            Some("Update check failed: network down")
+        );
+        assert!(update_event_is_error(&event));
+    }
+
+    #[test]
+    fn available_and_applied_do_not_claim_the_status_line() {
+        let available = UpdateEvent::Available(ReleaseInfo {
+            version: "v9.9.9".into(),
+            notes: "n".into(),
+            asset_url: "https://example.com/a.exe".into(),
+        });
+        // Available still returns a hint string (for callers that want it) but
+        // is not treated as an error.
+        assert!(update_event_status(&available).is_some());
+        assert!(!update_event_is_error(&available));
+        // Applied drives quit_event_loop, so it has no status text.
+        assert_eq!(update_event_status(&UpdateEvent::Applied("x".into())), None);
     }
 
     #[test]
