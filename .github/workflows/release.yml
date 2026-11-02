@@ -97,7 +97,7 @@ jobs:
       #     target\release\scrcpy-server.jar (see installer/fluxbridge.iss). The
       #     .jar is the MIT-licensed upstream scrcpy-server and is deliberately
       #     NOT vendored into this repository, so CI fetches the release asset
-      #     whose version matches SCRCPY_SERVER_VERSION ("2.4") in
+      #     whose version matches SCRCPY_SERVER_VERSION ("5.0.1") in
       #     crates/desktop/src/adb.rs. If the pinned version ever changes, bump
       #     SCRCPY_VERSION here and SCRCPY_SERVER_VERSION in adb.rs together.
       #     scrcpy is MIT-licensed; its LICENSE is staged alongside the jar and
@@ -105,7 +105,7 @@ jobs:
       - name: Fetch scrcpy server jar
         shell: pwsh
         env:
-          SCRCPY_VERSION: "2.4"
+          SCRCPY_VERSION: "5.0.1"
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path target\release | Out-Null
@@ -129,10 +129,10 @@ jobs:
             throw "scrcpy server download failed: expected asset '$asset' from $base was not written to $jarPath."
           }
           $size = (Get-Item $jarPath).Length
-          # The real v2.4 asset is ~69 KB. Anything well under 10 KB is an error
-          # page or a truncated download, not the jar.
+          # The real v5.0.1 asset is ~90 KB. Anything well under 10 KB is an
+          # error page or a truncated download, not the jar.
           if ($size -lt 10000) {
-            throw "scrcpy server download looks corrupt: '$asset' is only $size bytes (expected roughly 69 KB). This usually means GitHub served an error page or a truncated download."
+            throw "scrcpy server download looks corrupt: '$asset' is only $size bytes (expected roughly 90 KB). This usually means GitHub served an error page or a truncated download."
           }
           # A real ZIP/JAR begins with the magic bytes 'PK' (0x50 0x4B). An HTML
           # error page would begin with '<' (0x3C), so this catches a bad body

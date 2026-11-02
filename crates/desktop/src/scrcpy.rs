@@ -12,15 +12,21 @@
 //! access units:
 //!
 //! ```text
-//! device name : 64 bytes, NUL-padded UTF-8            (once)
-//! codec id    : u32 BE  (e.g. "h264" fourcc as a u32) (once, scrcpy >= 2.0)
-//! width       : u32 BE                                (once)
-//! height      : u32 BE                                (once)
+//! device name   : 64 bytes, NUL-padded UTF-8            (once, sendDeviceMeta)
+//! codec id      : u32 BE  (e.g. "h264" fourcc as a u32) (once, writeVideoHeader)
+//! session flags : u32 BE  (NEW in scrcpy >= 3.0/5.0.1)  (once, writeSessionMeta)
+//! width         : u32 BE                                (once, writeSessionMeta)
+//! height        : u32 BE                                (once, writeSessionMeta)
 //! --- then repeating, per access unit: ---
-//! pts/flags   : u64 BE  (top bits are config/keyframe flags)
+//! pts/flags   : u64 BE  (top bits are session/config/keyframe flags)
 //! packet len  : u32 BE
 //! payload     : <packet len> bytes of H.264
 //! ```
+//!
+//! The 4-byte `session flags` word is scrcpy 5.0.1's addition between
+//! `codec id` and `width` (the server's `writeSessionMeta` sets its high bit as
+//! a session marker). [`parse_video_header`] reads and discards it; omitting the
+//! read would shift `width`/`height` and desync the entire stream.
 //!
 //! [`parse_video_header`] reads the one-shot header and [`read_av_packet`] pulls
 //! one access unit; both operate on any [`std::io::Read`] so they are tested
@@ -95,12 +101,16 @@ pub struct AvPacket {
     pub data: Vec<u8>,
 }
 
-/// scrcpy sets the top bit of the 64-bit pts field for config packets.
-const PACKET_FLAG_CONFIG: u64 = 1u64 << 63;
-/// scrcpy sets the next bit for keyframes.
-const PACKET_FLAG_KEY_FRAME: u64 = 1u64 << 62;
-/// Mask of the real pts bits (everything below the two flag bits).
-const PACKET_PTS_MASK: u64 = (1u64 << 62) - 1;
+// scrcpy 5.0.1 per-packet pts/flags bit layout (shifted down one from 2.4 to
+// make room for PACKET_FLAG_SESSION = 1<<63 at the top):
+/// scrcpy sets this bit of the 64-bit pts field for config packets (SPS/PPS).
+/// In 5.0.1 this is bit 62 (was 1<<63 in 2.4, now taken by the session flag).
+const PACKET_FLAG_CONFIG: u64 = 1u64 << 62;
+/// scrcpy sets this bit for keyframes. In 5.0.1 this is bit 61 (was 1<<62).
+const PACKET_FLAG_KEY_FRAME: u64 = 1u64 << 61;
+/// Mask of the real pts bits (everything below the shifted flag bits). In 5.0.1
+/// the usable pts occupies the low 61 bits, so the mask is `(1<<61) - 1`.
+const PACKET_PTS_MASK: u64 = (1u64 << 61) - 1;
 
 /// Build the scrcpy fourcc `u32` for the four-character codec string, e.g.
 /// `"h264"`. Used by tests and header construction.
@@ -115,6 +125,10 @@ pub fn parse_video_header<R: Read>(r: &mut R) -> io::Result<VideoHeader> {
     let end = name.iter().position(|&b| b == 0).unwrap_or(DEVICE_NAME_LEN);
     let device_name = String::from_utf8_lossy(&name[..end]).into_owned();
     let codec_id = r.read_u32::<BigEndian>()?;
+    // scrcpy 5.0.1 writes a session-flags word (writeSessionMeta) between the
+    // codec id and the width. Read and discard it; skipping this read would
+    // shift width/height and desync the whole video stream.
+    let _session_flags = r.read_u32::<BigEndian>()?;
     let width = r.read_u32::<BigEndian>()?;
     let height = r.read_u32::<BigEndian>()?;
     Ok(VideoHeader {
@@ -797,6 +811,12 @@ mod tests {
         assert_eq!(buf, expected);
     }
 
+    /// scrcpy 5.0.1 session-flags word (writeSessionMeta sets the high bit).
+    /// Using a non-zero value here makes the test fail loudly if the
+    /// session-flags read is ever removed: the parser would then read this word
+    /// as the width and desync everything after it.
+    const TEST_SESSION_FLAGS: u32 = 0x8000_0000;
+
     #[test]
     fn parse_video_header_reads_name_codec_and_size() {
         let mut stream: Vec<u8> = Vec::new();
@@ -804,6 +824,8 @@ mod tests {
         name[..6].copy_from_slice(b"Pixel7");
         stream.extend_from_slice(&name);
         stream.extend_from_slice(&fourcc(b"h264").to_be_bytes());
+        // scrcpy 5.0.1 session-flags word between codec_id and width.
+        stream.extend_from_slice(&TEST_SESSION_FLAGS.to_be_bytes());
         stream.extend_from_slice(&1080u32.to_be_bytes());
         stream.extend_from_slice(&2400u32.to_be_bytes());
 
@@ -811,8 +833,32 @@ mod tests {
         let header = parse_video_header(&mut cursor).unwrap();
         assert_eq!(header.device_name, "Pixel7");
         assert_eq!(header.codec_id, fourcc(b"h264"));
+        // If the session-flags word were NOT consumed, width would be
+        // TEST_SESSION_FLAGS and height would be 1080. Asserting the real
+        // dimensions proves the 5.0.1 session-flags read happened.
         assert_eq!(header.width, 1080);
         assert_eq!(header.height, 2400);
+    }
+
+    /// Guards the 5.0.1 session-flags read explicitly: the width must be the
+    /// field AFTER the flags word, never the flags word itself.
+    #[test]
+    fn parse_video_header_consumes_session_flags_before_width() {
+        let mut stream: Vec<u8> = Vec::new();
+        let name = [0u8; DEVICE_NAME_LEN];
+        stream.extend_from_slice(&name);
+        stream.extend_from_slice(&fourcc(b"h264").to_be_bytes());
+        stream.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // session flags
+        stream.extend_from_slice(&720u32.to_be_bytes());
+        stream.extend_from_slice(&1600u32.to_be_bytes());
+
+        let mut cursor = std::io::Cursor::new(stream);
+        let header = parse_video_header(&mut cursor).unwrap();
+        assert_eq!(
+            header.width, 720,
+            "width must be read AFTER the session-flags word, not be the flags word"
+        );
+        assert_eq!(header.height, 1600);
     }
 
     #[test]
@@ -854,6 +900,44 @@ mod tests {
             matches!(read_av_packet(&mut cursor).unwrap(), PacketRead::Eof),
             "an exhausted cursor must read as a clean Eof"
         );
+    }
+
+    /// Pin the scrcpy 5.0.1 per-packet flag bit positions. In 5.0.1 the top bit
+    /// (1<<63) is PACKET_FLAG_SESSION, so config shifted to 1<<62, keyframe to
+    /// 1<<61, and the pts mask to (1<<61)-1. These values are load-bearing: at
+    /// the 2.4 positions a 5.0.1 keyframe would be misread as a config packet.
+    #[test]
+    fn packet_flag_bits_are_scrcpy_5_0_1_positions() {
+        assert_eq!(PACKET_FLAG_CONFIG, 1u64 << 62);
+        assert_eq!(PACKET_FLAG_KEY_FRAME, 1u64 << 61);
+        assert_eq!(PACKET_PTS_MASK, (1u64 << 61) - 1);
+
+        // A config packet (bit 62) must classify as config, not keyframe, and a
+        // keyframe packet (bit 61) must classify as keyframe, not config, with
+        // the low bits recovered as the pts.
+        let mut stream: Vec<u8> = Vec::new();
+        let config_pts = PACKET_FLAG_CONFIG | 42;
+        stream.extend_from_slice(&config_pts.to_be_bytes());
+        stream.extend_from_slice(&1u32.to_be_bytes());
+        stream.push(0x00);
+        let key_pts = PACKET_FLAG_KEY_FRAME | 7777;
+        stream.extend_from_slice(&key_pts.to_be_bytes());
+        stream.extend_from_slice(&1u32.to_be_bytes());
+        stream.push(0x65);
+
+        let mut cursor = std::io::Cursor::new(stream);
+        let c = match read_av_packet(&mut cursor).unwrap() {
+            PacketRead::Packet(p) => p,
+            other => panic!("expected a packet, got {other:?}"),
+        };
+        assert!(c.is_config && !c.is_keyframe);
+        assert_eq!(c.pts_us, 42);
+        let k = match read_av_packet(&mut cursor).unwrap() {
+            PacketRead::Packet(p) => p,
+            other => panic!("expected a packet, got {other:?}"),
+        };
+        assert!(k.is_keyframe && !k.is_config);
+        assert_eq!(k.pts_us, 7777);
     }
 
     /// A read timeout at a packet boundary (no bytes of the next packet
@@ -961,6 +1045,9 @@ mod tests {
         name[..6].copy_from_slice(b"Pixel7");
         stream.extend_from_slice(&name);
         stream.extend_from_slice(&fourcc(b"h264").to_be_bytes());
+        // scrcpy 5.0.1 session-flags word (writeSessionMeta) between codec_id
+        // and width; a parser that skips it would desync every later field.
+        stream.extend_from_slice(&TEST_SESSION_FLAGS.to_be_bytes());
         stream.extend_from_slice(&1080u32.to_be_bytes());
         stream.extend_from_slice(&2400u32.to_be_bytes());
         for (is_config, data) in frames {
