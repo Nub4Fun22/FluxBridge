@@ -50,6 +50,64 @@ pub struct DiscoveredDeviceInfo {
     pub label: String,
     /// Stable identifier: the mDNS instance name when known, else `host:port`.
     pub id: String,
+    /// Whether this device has already been paired (is in [`crate::devices`]).
+    ///
+    /// A remembered device gets a one-click Connect; a never-paired device is
+    /// routed to the Pair-first flow instead (a bare `adb connect` to an
+    /// unpaired device fails while still exiting 0, so offering Connect for it
+    /// would be a doomed action). The UI uses this flag to pick the Connect vs
+    /// Pair button per row.
+    pub remembered: bool,
+}
+
+/// Actionable guidance strings for the wireless panel.
+///
+/// These are extracted as pure functions/consts so a headless test can assert
+/// the wording stays actionable (routes the user to the right phone action)
+/// without spawning adb. Every message names the concrete next step. No em
+/// dashes anywhere in these strings.
+pub mod messages {
+    /// Shown when the user clicks Connect on a device that has never been
+    /// paired. A bare `adb connect` to such a device fails, so we refuse it and
+    /// point the user at the Pair flow instead.
+    pub fn not_paired_use_pair(label: &str) -> String {
+        format!(
+            "{label} has not been paired with this PC yet. On the phone open \
+             Settings > Developer options > Wireless debugging > Pair device with pairing \
+             code, then type the 6-digit code shown there into FluxBridge and click Pair. \
+             Connect only works after the first pairing."
+        )
+    }
+
+    /// Shown when pairing is requested but no `_adb-tls-pairing._tcp` endpoint
+    /// is advertised: the phone is not on the pairing screen (the code and the
+    /// endpoint exist only while that screen is open).
+    pub const OPEN_PAIRING_SCREEN: &str =
+        "No pairing code screen was found on the network. On the phone open Settings > \
+         Developer options > Wireless debugging > Pair device with pairing code and leave \
+         that screen open (its 6-digit code and endpoint exist only while it is open), \
+         then click Scan.";
+
+    /// Shown when no devices are discovered at all: wireless debugging may be
+    /// off or the phone may be on a different Wi-Fi network.
+    pub const NO_DEVICES_FOUND: &str =
+        "No devices found. On the phone, turn on Settings > Developer options > Wireless \
+         debugging and join the same Wi-Fi network as this PC. For a first pairing also \
+         open Pair device with pairing code, then click Scan again.";
+
+    /// Shown when a device connect fails in a way consistent with the phone not
+    /// having authorized this PC (offline / unauthorized).
+    pub const ACCEPT_DEBUGGING_PROMPT: &str =
+        "The phone did not accept the connection. On the phone, accept the Allow wireless \
+         debugging prompt for this PC, keep Wireless debugging on, then click Scan and try \
+         again.";
+
+    /// Shown when a remembered device is no longer advertised: its dynamic
+    /// connect port likely changed, so a fresh scan is needed.
+    pub const PORT_CHANGED_RESCAN: &str =
+        "That device is not being advertised right now. Its wireless port changes each \
+         session, so make sure Wireless debugging is on and the phone is on the same \
+         Wi-Fi, then click Scan again.";
 }
 
 /// Build the UI-facing device list from parsed mDNS services.
@@ -67,8 +125,57 @@ pub fn discovered_device_list(services: &[MdnsService]) -> Vec<DiscoveredDeviceI
         .map(|s| DiscoveredDeviceInfo {
             label: format!("{} ({})", s.instance_name, s.address()),
             id: s.instance_name.clone(),
+            remembered: false,
         })
         .collect()
+}
+
+/// Build the UI-facing device list, marking each row `remembered` when it is
+/// already paired according to `known`.
+///
+/// This is the remembered-aware variant of [`discovered_device_list`]: it keeps
+/// the same filtering (only connect endpoints) and the same label/id, but also
+/// consults [`KnownDevices`] so the UI can render a one-click Connect for a
+/// remembered device and route a never-paired device to the Pair-first flow.
+pub fn discovered_device_list_with(
+    services: &[MdnsService],
+    known: &KnownDevices,
+) -> Vec<DiscoveredDeviceInfo> {
+    services
+        .iter()
+        .filter(|s| s.is_connect())
+        .map(|s| DiscoveredDeviceInfo {
+            label: format!("{} ({})", s.instance_name, s.address()),
+            id: s.instance_name.clone(),
+            remembered: is_remembered(known, &s.instance_name, &s.host),
+        })
+        .collect()
+}
+
+/// Whether a discovered device is already remembered (has been paired before).
+///
+/// Matches by mDNS instance name when it is known (preferred, since it is
+/// stable across IP/port changes), otherwise by host. An unknown device returns
+/// `false`, which routes it to the Pair-first flow rather than a doomed
+/// one-click Connect.
+pub fn is_remembered(known: &KnownDevices, instance_name: &str, host: &str) -> bool {
+    known.iter().any(|d| {
+        if !instance_name.is_empty() {
+            if let Some(name) = d.instance_name.as_deref() {
+                return name == instance_name;
+            }
+        }
+        d.host == host
+    })
+}
+
+/// Load the remembered-devices set from the app data dir, or an empty set when
+/// the data dir cannot be resolved (so classification degrades to "new").
+fn load_known_devices() -> KnownDevices {
+    match crate::provision::data_dir() {
+        Ok(dir) => KnownDevices::load(&devices::devices_path(&dir)),
+        Err(_) => KnownDevices::new(),
+    }
 }
 
 /// Pick the pairing endpoint (`_adb-tls-pairing._tcp`) from discovered services.
@@ -215,15 +322,25 @@ pub fn scan(events: &Sender<WirelessEvent>) {
     ));
     match cmd.mdns_services() {
         Ok(services) => {
-            let list = discovered_device_list(&services);
+            let known = load_known_devices();
+            let list = discovered_device_list_with(&services, &known);
             let count = list.len();
+            let remembered = list.iter().filter(|d| d.remembered).count();
             let _ = events.send(WirelessEvent::Devices(list));
             let msg = if count == 0 {
-                "No devices found. On the phone, open Wireless debugging (and 'Pair \
-                 device with pairing code' for a first pairing), then Scan again."
-                    .to_string()
+                messages::NO_DEVICES_FOUND.to_string()
+            } else if remembered == count {
+                format!("Found {count} device(s). Click Connect to start mirroring.")
+            } else if remembered == 0 {
+                format!(
+                    "Found {count} device(s). None are paired with this PC yet; open \
+                     Pair device with pairing code on the phone and click Pair."
+                )
             } else {
-                format!("Found {count} device(s).")
+                format!(
+                    "Found {count} device(s). Click Connect for a paired device, or Pair \
+                     for a new one."
+                )
             };
             let _ = events.send(WirelessEvent::Status(msg));
         }
@@ -265,11 +382,7 @@ pub fn pair_and_connect(events: &Sender<WirelessEvent>, raw_code: &str, selected
     };
 
     let Some(pairing) = pairing_endpoint(&services) else {
-        let _ = events.send(WirelessEvent::Error(
-            "No pairing endpoint found. On the phone, open 'Pair device with pairing \
-             code' so FluxBridge can see it, then try again."
-                .to_string(),
-        ));
+        let _ = events.send(WirelessEvent::Error(messages::OPEN_PAIRING_SCREEN.to_string()));
         return;
     };
     let pairing = pairing.clone();
@@ -296,8 +409,9 @@ pub fn pair_and_connect(events: &Sender<WirelessEvent>, raw_code: &str, selected
             // same host once paired, but without a connect port we cannot
             // proceed, so report honestly.
             let _ = events.send(WirelessEvent::Error(
-                "Paired, but no connect endpoint was advertised yet. Click Scan, then \
-                 Connect the device from the list."
+                "Paired successfully, but the phone has not advertised a connect endpoint \
+                 yet. Keep Wireless debugging on, then click Scan and Connect the device \
+                 from the list."
                     .to_string(),
             ));
             return;
@@ -309,6 +423,11 @@ pub fn pair_and_connect(events: &Sender<WirelessEvent>, raw_code: &str, selected
 
 /// Connect an ALREADY-paired device (selected from the discovered list) and
 /// start mirroring; no pairing code needed.
+///
+/// If the selected device has NOT been paired with this PC before, this refuses
+/// to run a bare `adb connect` (which would fail while still exiting 0 against
+/// an unpaired device) and instead emits actionable guidance routing the user
+/// to the Pair flow. Only a remembered device proceeds to connect.
 pub fn connect_device(events: &Sender<WirelessEvent>, selected_id: &str) {
     let Some(cmd) = resolve_adb(events) else {
         return;
@@ -323,12 +442,20 @@ pub fn connect_device(events: &Sender<WirelessEvent>, selected_id: &str) {
     let connect = match connect_endpoint(&services, selected_id) {
         Some(c) => c.clone(),
         None => {
-            let _ = events.send(WirelessEvent::Error(
-                "That device is no longer advertised. Click Scan and try again.".to_string(),
-            ));
+            let _ = events.send(WirelessEvent::Error(messages::PORT_CHANGED_RESCAN.to_string()));
             return;
         }
     };
+
+    // Refuse a doomed connect for a never-paired device: adb connect to an
+    // unpaired device fails (often exiting 0), so route the user to Pair.
+    let known = load_known_devices();
+    if !is_remembered(&known, &connect.instance_name, &connect.host) {
+        let label = format!("{} ({})", connect.instance_name, connect.address());
+        let _ = events.send(WirelessEvent::Error(messages::not_paired_use_pair(&label)));
+        return;
+    }
+
     finish_connect(events, &cmd, &connect);
 }
 
@@ -349,7 +476,10 @@ fn finish_connect(events: &Sender<WirelessEvent>, cmd: &AdbCommand, connect: &Md
             let _ = events.send(WirelessEvent::Connected(Transport::from_wireless(&conn)));
         }
         Err(e) => {
-            let _ = events.send(WirelessEvent::Error(format!("Connect failed: {e}")));
+            let _ = events.send(WirelessEvent::Error(format!(
+                "Connect failed: {e}. {}",
+                messages::ACCEPT_DEBUGGING_PROMPT
+            )));
         }
     }
 }
@@ -405,6 +535,14 @@ mod tests {
         ]
     }
 
+    fn remembered_known(instance: &str, host: &str, port: u16) -> KnownDevices {
+        let mut known = KnownDevices::new();
+        let mut d = PairedDevice::new(host, port);
+        d.instance_name = Some(instance.to_string());
+        known.upsert(d);
+        known
+    }
+
     #[test]
     fn device_list_shows_only_connect_endpoints() {
         let list = discovered_device_list(&sample_services());
@@ -412,6 +550,85 @@ mod tests {
         assert_eq!(list[0].id, "adb-AAAA-1");
         assert_eq!(list[0].label, "adb-AAAA-1 (192.168.1.42:37000)");
         assert_eq!(list[1].id, "adb-BBBB-2");
+        // The pure list makes no claims about pairing state.
+        assert!(!list[0].remembered);
+        assert!(!list[1].remembered);
+    }
+
+    #[test]
+    fn is_remembered_matches_by_instance_name_then_host() {
+        let known = remembered_known("adb-AAAA-1", "192.168.1.42", 37000);
+        // Known instance name is remembered even if the IP/port differs.
+        assert!(is_remembered(&known, "adb-AAAA-1", "10.0.0.9"));
+        // An unknown device is not remembered.
+        assert!(!is_remembered(&known, "adb-BBBB-2", "192.168.1.99"));
+
+        // With no instance name, matching falls back to host.
+        let mut host_only = KnownDevices::new();
+        host_only.upsert(PairedDevice::new("192.168.1.50", 5555));
+        assert!(is_remembered(&host_only, "", "192.168.1.50"));
+        assert!(!is_remembered(&host_only, "", "192.168.1.51"));
+    }
+
+    #[test]
+    fn remembered_aware_list_sets_remembered_per_row() {
+        let known = remembered_known("adb-AAAA-1", "192.168.1.42", 37000);
+        let list = discovered_device_list_with(&sample_services(), &known);
+        assert_eq!(list.len(), 2);
+        // adb-AAAA-1 is remembered; adb-BBBB-2 is new.
+        let aaaa = list.iter().find(|d| d.id == "adb-AAAA-1").unwrap();
+        let bbbb = list.iter().find(|d| d.id == "adb-BBBB-2").unwrap();
+        assert!(aaaa.remembered, "the known device is remembered");
+        assert!(!bbbb.remembered, "the unknown device is not remembered");
+    }
+
+    #[test]
+    fn connect_decision_refuses_new_device_and_routes_to_pair() {
+        // The decision connect_device() makes: a device NOT in KnownDevices is
+        // never offered a bare adb connect; it gets an actionable not-paired
+        // message mentioning Pair instead. We assert the pure classifier +
+        // message here because the live adb connect is not runnable headless.
+        let known = remembered_known("adb-AAAA-1", "192.168.1.42", 37000);
+        let new_service = svc("adb-BBBB-2", adb::MDNS_CONNECT_TYPE, "192.168.1.99", 44000);
+
+        assert!(
+            !is_remembered(&known, &new_service.instance_name, &new_service.host),
+            "an unpaired device is classified as new"
+        );
+        let label = format!("{} ({})", new_service.instance_name, new_service.address());
+        let msg = messages::not_paired_use_pair(&label);
+        assert!(msg.contains("Pair"), "not-paired message routes to Pair");
+        assert!(msg.contains(&label), "message names the device");
+
+        // A remembered device IS allowed to connect.
+        let known_service = svc("adb-AAAA-1", adb::MDNS_CONNECT_TYPE, "192.168.1.42", 37000);
+        assert!(is_remembered(
+            &known,
+            &known_service.instance_name,
+            &known_service.host
+        ));
+    }
+
+    #[test]
+    fn actionable_messages_contain_expected_guidance_keywords() {
+        assert!(messages::not_paired_use_pair("dev").contains("Pair"));
+        assert!(messages::OPEN_PAIRING_SCREEN.contains("Pair device with pairing code"));
+        assert!(messages::OPEN_PAIRING_SCREEN.contains("Scan"));
+        assert!(messages::NO_DEVICES_FOUND.contains("Wireless debugging"));
+        assert!(messages::NO_DEVICES_FOUND.contains("Wi-Fi"));
+        assert!(messages::ACCEPT_DEBUGGING_PROMPT.contains("accept"));
+        assert!(messages::PORT_CHANGED_RESCAN.contains("Scan"));
+
+        // No em dashes anywhere in the actionable copy.
+        for m in [
+            messages::not_paired_use_pair("x"),
+            messages::OPEN_PAIRING_SCREEN.to_string(),
+            messages::NO_DEVICES_FOUND.to_string(),
+            messages::ACCEPT_DEBUGGING_PROMPT.to_string(),
+            messages::PORT_CHANGED_RESCAN.to_string(),
+        ] {
+            assert!(!m.contains('\u{2014}'), "no em dash in: {m}");
+        }
     }
 
     #[test]

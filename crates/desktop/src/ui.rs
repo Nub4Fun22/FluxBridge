@@ -433,6 +433,7 @@ fn wire_wireless_panel(
                             .map(|d| DiscoveredDevice {
                                 label: d.label.into(),
                                 id: d.id.into(),
+                                remembered: d.remembered,
                             })
                             .collect();
                         w.set_wireless_devices(
