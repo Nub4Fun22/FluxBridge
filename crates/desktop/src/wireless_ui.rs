@@ -176,7 +176,19 @@ fn resolve_adb(events: &Sender<WirelessEvent>) -> Option<AdbCommand> {
     };
     let transport = fluxbridge_updater::UreqTransport::default();
     match crate::provision::ensure_adb(&data_dir, &transport, &mut progress) {
-        Ok(path) => Some(AdbCommand::with_path(path, DeviceSelector::UsbDefault)),
+        // Bind the command to the path ensure_adb RETURNED so the just-installed
+        // adb is used immediately, in THIS same worker invocation, with no app
+        // restart. We deliberately do not re-run locate_adb here (which could
+        // still miss the fresh copy on some hosts); the returned path is the
+        // authoritative provisioned adb. Emit a clear status so the user sees
+        // the install finished and the action is continuing without a restart.
+        Ok(path) => {
+            let _ = events.send(WirelessEvent::Status(format!(
+                "Android platform-tools installed at {}. Continuing...",
+                path.display()
+            )));
+            Some(AdbCommand::with_path(path, DeviceSelector::UsbDefault))
+        }
         Err(_) => {
             let _ = events.send(WirelessEvent::Error(
                 "adb is not installed and could not be downloaded. Check your internet \
