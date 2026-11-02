@@ -158,15 +158,28 @@ fn is_timeout(e: &io::Error) -> bool {
 /// timeout fires at a packet boundary before any byte of the next packet is
 /// consumed (so the caller can wake, re-check cancellation, and retry). Once the
 /// first bytes of a packet header have been read, a timeout mid-packet is still
-/// an error (a truncated packet), since partial framing cannot be resumed.
+/// an error (a truncated packet), since partial framing cannot be resumed: a
+/// split pts-header read (some but not all 8 bytes consumed before the timeout)
+/// surfaces as an `UnexpectedEof` error, NOT as [`PacketRead::TimedOut`]. The
+/// len and payload reads after the header likewise propagate a timeout as an
+/// error.
 pub fn read_av_packet<R: Read>(r: &mut R) -> io::Result<PacketRead> {
     let mut pts_buf = [0u8; 8];
-    match read_full_or_eof(r, &mut pts_buf) {
-        Ok(true) => {}
-        Ok(false) => return Ok(PacketRead::Eof),
-        // A timeout at the very start of a packet is a wake, not a failure.
-        Err(ref e) if is_timeout(e) => return Ok(PacketRead::TimedOut),
-        Err(e) => return Err(e),
+    match read_full_or_eof(r, &mut pts_buf)? {
+        HeaderRead::Full => {}
+        HeaderRead::Eof => return Ok(PacketRead::Eof),
+        // A timeout with ZERO bytes consumed is a boundary wake, not a failure:
+        // the loop re-checks its cancel flag and retries.
+        HeaderRead::TimedOutAtBoundary => return Ok(PacketRead::TimedOut),
+        // A timeout AFTER some header bytes were already read splits the pts
+        // header. Partial framing cannot be resumed (re-reading would desync the
+        // stream), so this is a truncated-packet error, never a wake.
+        HeaderRead::TimedOutMidHeader(read) => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("scrcpy packet header timed out after {read} of 8 bytes"),
+            ))
+        }
     }
     let pts_flags = u64::from_be_bytes(pts_buf);
     let len = r.read_u32::<BigEndian>()? as usize;
@@ -180,16 +193,40 @@ pub fn read_av_packet<R: Read>(r: &mut R) -> io::Result<PacketRead> {
     }))
 }
 
-/// Read exactly `buf.len()` bytes, returning `Ok(false)` if the stream ends
-/// cleanly before any byte is read, `Ok(true)` on a full read, and an error on
-/// a partial read (truncated packet).
-fn read_full_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+/// The outcome of filling a packet-header buffer, distinguishing a timeout that
+/// fired at a packet boundary (no bytes consumed, a safe wake) from one that
+/// fired after part of the header was already read (a split header that cannot
+/// be resumed).
+#[derive(Debug, PartialEq, Eq)]
+enum HeaderRead {
+    /// The buffer was filled completely.
+    Full,
+    /// The stream ended cleanly before any byte was read.
+    Eof,
+    /// A read timeout fired with zero bytes consumed (a packet boundary).
+    TimedOutAtBoundary,
+    /// A read timeout fired after `0 < n < buf.len()` bytes were consumed,
+    /// splitting the header. Carries the byte count for the error message.
+    TimedOutMidHeader(usize),
+}
+
+/// Read exactly `buf.len()` bytes, reporting how the read terminated.
+///
+/// Returns [`HeaderRead::Full`] on a complete read, [`HeaderRead::Eof`] when the
+/// stream ends cleanly before any byte is read, and an error on a partial read
+/// that hits EOF mid-buffer (truncated packet). A read timeout is surfaced
+/// structurally so the caller can tell a zero-progress boundary timeout
+/// ([`HeaderRead::TimedOutAtBoundary`]) apart from a timeout that already
+/// consumed part of the header ([`HeaderRead::TimedOutMidHeader`]); only the
+/// former is a safe wake, since a split header cannot be resumed without
+/// desyncing the stream.
+fn read_full_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<HeaderRead> {
     let mut read = 0;
     while read < buf.len() {
         match r.read(&mut buf[read..]) {
             Ok(0) => {
                 if read == 0 {
-                    return Ok(false);
+                    return Ok(HeaderRead::Eof);
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -198,10 +235,16 @@ fn read_full_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
             }
             Ok(n) => read += n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(ref e) if is_timeout(e) => {
+                if read == 0 {
+                    return Ok(HeaderRead::TimedOutAtBoundary);
+                }
+                return Ok(HeaderRead::TimedOutMidHeader(read));
+            }
             Err(e) => return Err(e),
         }
     }
-    Ok(true)
+    Ok(HeaderRead::Full)
 }
 
 /// Consume the leading dummy byte scrcpy writes in tunnel-forward mode.
@@ -295,9 +338,13 @@ pub fn never_cancel() -> bool {
 /// `should_cancel` is checked once per iteration so a cooperative stop (the
 /// "Stop mirroring" control) breaks the loop promptly between access units.
 /// Because the underlying socket read can block, the caller sets a read timeout
-/// so the loop wakes periodically and observes the flag; a timed-out read
-/// surfaces as an error and ends the loop. Callers that never cancel pass a
-/// closure that always returns `false` (see [`never_cancel`]).
+/// so the loop wakes periodically and observes the flag; a read that times out
+/// at a packet boundary surfaces as [`PacketRead::TimedOut`], which the loop
+/// treats as a wake (a `continue` that re-checks `should_cancel`) rather than an
+/// error, so Stop is observed within one timeout on a stalled stream. A timeout
+/// that splits a packet header is still a fatal truncated-packet error.
+/// Callers that never cancel pass a closure that always returns `false` (see
+/// [`never_cancel`]).
 pub fn stream_av_packets<R: Read>(
     reader: &mut R,
     decoder: &mut dyn VideoDecoder,
@@ -725,6 +772,41 @@ mod tests {
         assert!(
             matches!(read_av_packet(&mut r).unwrap(), PacketRead::TimedOut),
             "a boundary timeout must be a wake, not an error or Eof"
+        );
+    }
+
+    /// A read timeout that fires AFTER some but not all 8 pts-header bytes are
+    /// consumed splits the header. Partial framing cannot be resumed (retrying
+    /// would re-read from a desynced position), so this must surface as a
+    /// truncated-packet ERROR, NOT [`PacketRead::TimedOut`]. This guards the
+    /// boundary-vs-mid-packet contract the Stop-latency fix depends on.
+    #[test]
+    fn read_av_packet_errors_on_split_header_timeout() {
+        // First read yields 4 of the 8 header bytes, then the read times out.
+        struct SplitHeaderReader {
+            delivered: usize,
+        }
+        impl Read for SplitHeaderReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.delivered == 0 {
+                    let n = 4.min(buf.len());
+                    for b in buf[..n].iter_mut() {
+                        *b = 0;
+                    }
+                    self.delivered += n;
+                    Ok(n)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"))
+                }
+            }
+        }
+        let mut r = SplitHeaderReader { delivered: 0 };
+        let err = read_av_packet(&mut r)
+            .expect_err("a mid-header timeout must be an error, not a TimedOut wake");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "a split pts-header timeout is a truncated-packet error"
         );
     }
 

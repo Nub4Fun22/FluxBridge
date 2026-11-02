@@ -745,7 +745,7 @@ fn run_stream(
     }
 
     // The access-unit loop checks the cancel flag once per iteration so a Stop
-    // breaks it promptly between packets; the 30s socket read timeout set above
+    // breaks it promptly between packets; the 2s STREAM_READ_TIMEOUT set above
     // lets a blocked read wake to observe the flag.
     let cancelled = || is_cancelled(cancel);
     if let Err(e) = crate::scrcpy::stream_av_packets(&mut video, &mut decoder, &sink, &cancelled) {
