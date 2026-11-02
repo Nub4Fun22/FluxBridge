@@ -19,6 +19,21 @@ fluxbridge-updater = { workspace = true }
 # framing, and control-message encoders (crates/desktop/src/scrcpy.rs). Same
 # crate the core protocol uses, so no new transitive surface.
 byteorder = { workspace = true }
+# Per-user application data directory resolution for adb auto-provisioning
+# (crates/desktop/src/provision.rs). Pure Rust with no native linkage, so it is
+# a NORMAL (non-optional) dependency safe in the default headless build. On
+# Windows ProjectDirs lands the data dir at %LOCALAPPDATA%\FluxBridge, where the
+# bundled platform-tools (adb) is downloaded and extracted once.
+directories = "5"
+# Extract the official Google platform-tools zip during adb auto-provisioning
+# (crates/desktop/src/provision.rs). CRITICAL: default-features=false with only
+# the `deflate` feature. The zip crate's default features pull in native C
+# libraries (zstd-sys / bzip2-sys / lzma-sys) which would break the headless
+# default build's zero-native-linkage guarantee. The platform-tools zips use
+# standard deflate compression, so deflate-only is sufficient and keeps this a
+# pure-Rust dependency. The HTTP download REUSES the fluxbridge-updater
+# UreqTransport (already a dependency); no new HTTP crate is added.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Slint is optional and OFF by default. The headless Linux CI host has no
 # display server and no guarantee of the system GUI libraries Slint's backends
 # need, so the default build compiles all the pure-Rust logic (connection,

@@ -34,6 +34,7 @@ mod adb;
 mod connection;
 mod decode_loop;
 mod pipeline;
+mod provision;
 mod scrcpy;
 mod updater_ui;
 

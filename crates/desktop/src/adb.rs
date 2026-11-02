@@ -335,6 +335,19 @@ pub fn locate_adb() -> Result<PathBuf, AdbError> {
     let mut searched: Vec<String> = Vec::new();
     let exe = adb_exe_name();
 
+    // 0. A previously auto-provisioned bundled adb (see
+    //    `crate::provision`). Once FluxBridge has downloaded platform-tools into
+    //    the per-user data dir, that copy is preferred so adb is found on every
+    //    subsequent run without re-downloading and without depending on the
+    //    user having installed an SDK or edited PATH.
+    if let Ok(data_dir) = crate::provision::data_dir() {
+        let candidate = crate::provision::provisioned_adb_path(&data_dir);
+        searched.push(candidate.display().to_string());
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
     // 1. Android SDK environment variables.
     for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
         if let Some(root) = std::env::var_os(var) {
@@ -366,6 +379,22 @@ pub fn locate_adb() -> Result<PathBuf, AdbError> {
     }
 
     Err(AdbError::NotFound { searched })
+}
+
+/// Locate adb, preferring a bundled copy already provisioned under `data_dir`.
+///
+/// This is the entry point the pipeline uses so the lookup is deterministic and
+/// testable with an explicit data dir: if `<data_dir>/platform-tools/adb[.exe]`
+/// exists it is returned immediately, otherwise the lookup falls back to the
+/// full [`locate_adb`] search order (SDK env vars, PATH, fixed locations). When
+/// everything fails the caller can auto-provision adb into `data_dir` via
+/// [`crate::provision::ensure_adb`] and call again.
+pub fn locate_or_provisioned(data_dir: &Path) -> Result<PathBuf, AdbError> {
+    let provisioned = crate::provision::provisioned_adb_path(data_dir);
+    if provisioned.is_file() {
+        return Ok(provisioned);
+    }
+    locate_adb()
 }
 
 /// Common fixed locations adb is installed to, per OS.
@@ -576,6 +605,35 @@ mod tests {
                 other => panic!("expected NotFound, got {other:?}"),
             }
         });
+    }
+
+    /// When a bundled adb has been provisioned under the data dir,
+    /// [`locate_or_provisioned`] returns it ahead of the normal search order
+    /// (which, with the SDK vars and PATH stripped, would otherwise be a
+    /// NotFound). A dummy file stands in for the real adb binary.
+    #[test]
+    fn locate_or_provisioned_prefers_bundled_adb() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "fluxbridge-locate-prov-{}",
+            std::process::id()
+        ));
+        let adb_path = crate::provision::provisioned_adb_path(&data_dir);
+        std::fs::create_dir_all(adb_path.parent().unwrap()).unwrap();
+        std::fs::write(&adb_path, b"dummy adb").unwrap();
+
+        temp_env_clear(|| {
+            // Strip everything so the fallback search would fail; the bundled
+            // copy must still be found and returned first.
+            std::env::remove_var("ANDROID_HOME");
+            std::env::remove_var("ANDROID_SDK_ROOT");
+            std::env::set_var("PATH", "/nonexistent-path-xyz");
+            std::env::remove_var("HOME");
+            std::env::remove_var("LOCALAPPDATA");
+            let found = locate_or_provisioned(&data_dir).expect("bundled adb should be found");
+            assert_eq!(found, adb_path);
+        });
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// Run `f` with a saved/restored snapshot of the env vars we mutate, so the

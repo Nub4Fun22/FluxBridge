@@ -123,6 +123,13 @@ fn exe_dir() -> Option<std::path::PathBuf> {
 pub enum PipelineStatus {
     /// adb was located at the given path.
     AdbLocated(String),
+    /// adb was not found, so FluxBridge is downloading Google's platform-tools;
+    /// carries a `0..=100` download percentage.
+    ProvisioningAdb(u8),
+    /// The downloaded platform-tools are being extracted.
+    ExtractingAdb,
+    /// adb was auto-provisioned (downloaded + extracted) at the given path.
+    AdbProvisioned(String),
     /// A Wi-Fi `adb connect` to the device succeeded.
     Connected(String),
     /// The scrcpy server jar was pushed to the device.
@@ -143,6 +150,11 @@ impl fmt::Display for PipelineStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PipelineStatus::AdbLocated(p) => write!(f, "adb located at {p}"),
+            PipelineStatus::ProvisioningAdb(pct) => {
+                write!(f, "Downloading Android platform-tools... {pct}%")
+            }
+            PipelineStatus::ExtractingAdb => write!(f, "Extracting Android platform-tools..."),
+            PipelineStatus::AdbProvisioned(p) => write!(f, "adb installed at {p}"),
             PipelineStatus::Connected(s) => write!(f, "connected to {s}"),
             PipelineStatus::ServerPushed => write!(f, "server pushed to device"),
             PipelineStatus::Forwarded(p) => write!(f, "forwarding 127.0.0.1:{p}"),
@@ -157,6 +169,67 @@ impl fmt::Display for PipelineStatus {
 /// Send a status, ignoring a dropped receiver (the UI may have closed).
 fn report(tx: &Sender<PipelineStatus>, status: PipelineStatus) {
     let _ = tx.send(status);
+}
+
+/// Locate adb, auto-provisioning it if it cannot be found.
+///
+/// First tries [`crate::adb::locate_or_provisioned`] (which prefers a bundled
+/// copy already under the per-user data dir, then the SDK/PATH/fixed-location
+/// search). If that fails with [`adb::AdbError::NotFound`], FluxBridge
+/// downloads and extracts Google's official platform-tools via
+/// [`crate::provision::ensure_adb`], reporting download/extract progress as
+/// [`PipelineStatus`] updates, and returns the bundled adb path.
+///
+/// On a provisioning failure (for example no network access offline) the
+/// original [`adb::AdbError::NotFound`] is returned unchanged, so the caller
+/// surfaces the existing actionable "install Android platform-tools" guidance
+/// rather than an opaque download error. The one-time download and the bundled
+/// adb execution are only reachable on the user's machine and are verified
+/// there; the headless host has no network guarantee and no adb.
+fn locate_or_provision_adb(status: &Sender<PipelineStatus>) -> Result<std::path::PathBuf, adb::AdbError> {
+    // Resolve the per-user data dir once; if it cannot be resolved, fall back
+    // to the plain search (which still works when adb is already installed).
+    let data_dir = crate::provision::data_dir().ok();
+
+    let located = match &data_dir {
+        Some(dir) => adb::locate_or_provisioned(dir),
+        None => adb::locate_adb(),
+    };
+
+    let not_found = match located {
+        Ok(path) => return Ok(path),
+        Err(e @ adb::AdbError::NotFound { .. }) => e,
+        // A non-NotFound error (I/O) is not something provisioning fixes.
+        Err(e) => return Err(e),
+    };
+
+    // adb is absent: try to auto-provision it. If we have no data dir there is
+    // nowhere to install it, so surface the original NotFound guidance.
+    let dir = match data_dir {
+        Some(dir) => dir,
+        None => return Err(not_found),
+    };
+
+    let mut on_progress = |p: crate::provision::ProvisionProgress| match p {
+        crate::provision::ProvisionProgress::Downloading(pct) => {
+            report(status, PipelineStatus::ProvisioningAdb(pct));
+        }
+        crate::provision::ProvisionProgress::Extracting => {
+            report(status, PipelineStatus::ExtractingAdb);
+        }
+        crate::provision::ProvisionProgress::Done(path) => {
+            report(status, PipelineStatus::AdbProvisioned(path.display().to_string()));
+        }
+    };
+
+    let transport = fluxbridge_updater::UreqTransport::default();
+    match crate::provision::ensure_adb(&dir, &transport, &mut on_progress) {
+        Ok(path) => Ok(path),
+        // Provisioning failed (offline, extract error, ...). Return the
+        // original NotFound so the user still gets the actionable install
+        // guidance that the AdbError::NotFound Display text carries.
+        Err(_) => Err(not_found),
+    }
 }
 
 /// Perform the adb-driven startup and run the decode loop, reporting progress
@@ -207,8 +280,13 @@ pub fn run_pipeline_full(
 ) -> Result<(), adb::AdbError> {
     let selector = config.selector();
 
-    // 1. Locate adb.
-    let adb_path = match adb::locate_adb() {
+    // 1. Locate adb, preferring a previously provisioned bundled copy. If adb
+    //    cannot be found anywhere, auto-provision it (download + extract
+    //    Google's official platform-tools into the per-user data dir) before
+    //    failing, so a non-technical user never has to install the SDK. A
+    //    download/extract failure (for example offline) falls back to the
+    //    existing actionable "install adb" guidance.
+    let adb_path = match locate_or_provision_adb(status) {
         Ok(p) => p,
         Err(e) => {
             report(status, PipelineStatus::Error(e.to_string()));
@@ -633,16 +711,29 @@ mod tests {
         static LOCK: Mutex<()> = Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            ["ANDROID_HOME", "ANDROID_SDK_ROOT", "PATH", "HOME", "LOCALAPPDATA"]
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
+        // Also strip the vars `directories` uses to resolve the data dir
+        // (HOME / XDG_DATA_HOME on unix, LOCALAPPDATA on Windows) so
+        // `provision::data_dir()` returns None and the pipeline does NOT
+        // attempt a live platform-tools download from this headless host. We
+        // are asserting the offline-fallback path: no data dir -> the original
+        // NotFound guidance is surfaced.
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "ANDROID_HOME",
+            "ANDROID_SDK_ROOT",
+            "PATH",
+            "HOME",
+            "LOCALAPPDATA",
+            "XDG_DATA_HOME",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
         std::env::set_var("ANDROID_HOME", "/nonexistent-sdk-xyz");
         std::env::remove_var("ANDROID_SDK_ROOT");
         std::env::set_var("PATH", "/nonexistent-path-xyz");
         std::env::remove_var("HOME");
         std::env::remove_var("LOCALAPPDATA");
+        std::env::remove_var("XDG_DATA_HOME");
 
         let (tx, rx) = mpsc::channel();
         let cfg = PipelineConfig::default();
@@ -672,6 +763,24 @@ mod tests {
         assert_eq!(
             PipelineStatus::Error("no device".into()).to_string(),
             "error: no device"
+        );
+    }
+
+    /// The adb auto-provisioning status variants render human-readable text the
+    /// GUI can show on its status line (download percent, extraction, done).
+    #[test]
+    fn provisioning_status_display_is_human_readable() {
+        assert_eq!(
+            PipelineStatus::ProvisioningAdb(42).to_string(),
+            "Downloading Android platform-tools... 42%"
+        );
+        assert_eq!(
+            PipelineStatus::ExtractingAdb.to_string(),
+            "Extracting Android platform-tools..."
+        );
+        assert_eq!(
+            PipelineStatus::AdbProvisioned("/data/platform-tools/adb".into()).to_string(),
+            "adb installed at /data/platform-tools/adb"
         );
     }
 }
