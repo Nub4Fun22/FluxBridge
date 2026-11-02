@@ -540,7 +540,13 @@ impl Default for ServerLaunchOptions {
             max_size: 0,
             bit_rate: 8_000_000,
             max_fps: 0,
-            tunnel_forward: true,
+            // Reverse tunneling is scrcpy's own default and the shipped
+            // FluxBridge default: the device connects OUT to a desktop
+            // listener, so the server never writes the forward-mode leading
+            // dummy byte and there is no forward-mode readiness race. The
+            // forward path (tunnel_forward=true) stays reachable when set
+            // explicitly.
+            tunnel_forward: false,
         }
     }
 }
@@ -1330,7 +1336,7 @@ mod tests {
                 "max_size=0",
                 "video_bit_rate=8000000",
                 "max_fps=0",
-                "tunnel_forward=true",
+                "tunnel_forward=false",
                 "audio=false",
                 "control=true",
             ]

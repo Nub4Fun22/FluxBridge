@@ -4,11 +4,20 @@
 //!
 //! 1. Locate `adb` on the host ([`crate::adb::locate_adb`]).
 //! 2. For Wi-Fi, `adb connect <ip:port>`; for USB, use the sole attached device.
-//! 3. Push the scrcpy server jar and set up the adb `forward` tunnel.
+//! 3. Push the scrcpy server jar and set up the tunnel. The SHIPPED default is
+//!    REVERSE tunneling (scrcpy's own default): the desktop binds a local
+//!    [`std::net::TcpListener`] and runs `adb reverse localabstract:scrcpy
+//!    tcp:<local_port>` so the device connects OUT to it, which avoids the
+//!    forward-mode leading dummy byte and its readiness race. The legacy
+//!    forward path (`adb forward` + dialing the local socket + consuming the
+//!    dummy byte) stays reachable when `tunnel_forward=true` is set explicitly.
 //! 4. Launch the scrcpy server via `app_process`.
-//! 5. Connect the local TCP socket adb forwards and run the decode loop.
-//! 6. On exit (or any failure) tear down: remove the forward, kill the server
-//!    child, and disconnect Wi-Fi.
+//! 5. In reverse mode, accept the device's inbound video then control sockets
+//!    from the listener; in forward mode, dial the forwarded local socket. Then
+//!    run the decode loop.
+//! 6. On exit (or any failure) tear down: remove the tunnel that was set up
+//!    (`adb reverse --remove` in reverse mode, `adb forward --remove` in forward
+//!    mode), kill the server child, and disconnect Wi-Fi.
 //!
 //! Every notable transition and every failure is reported as a
 //! [`PipelineStatus`] on an `mpsc` channel. The GUI build drains that channel
@@ -17,7 +26,8 @@
 //! may print the same statuses to stdout.
 //!
 //! The adb teardown commands and the status-reporting flow are unit-tested;
-//! the parts that require a live device (`push`, `app_process`, the socket) are
+//! the reverse accept budget), the parts that require a live device (`push`,
+//! `app_process`, the socket) are
 //! only reached at runtime on the user's machine, never on the headless CI host.
 
 use std::fmt;
@@ -365,6 +375,19 @@ const DUMMY_BYTE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// instead of blocking forever.
 const DUMMY_BYTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Total time budget for accepting the device's inbound reverse-mode sockets.
+///
+/// In reverse mode the desktop LISTENS and the device connects out AFTER the
+/// server launches, so there is a brief window where no peer has connected yet.
+/// The accept loop polls (honoring the cancel flag) up to this budget; if the
+/// server never connects back (the failure case) it gives up instead of
+/// blocking forever, and the error carries the captured server output. The
+/// budget mirrors the forward-mode dummy-byte retry budget
+/// ([`DUMMY_BYTE_RETRY_ATTEMPTS`] x [`DUMMY_BYTE_RETRY_BACKOFF`] ~= 2s).
+const REVERSE_ACCEPT_ATTEMPTS: u32 = 20;
+/// Poll interval between reverse-mode accept attempts (20 x 100ms ~= 2s total).
+const REVERSE_ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Short bounded grace wait before snapshotting the server output on the
 /// failure path. The server's stdout/stderr are drained by detached reader
 /// threads (see [`spawn_server_output_reader`]); when the stream fails to start
@@ -543,6 +566,57 @@ fn connect_forward_video(addr: &str) -> std::io::Result<std::net::TcpStream> {
     }))
 }
 
+/// Accept one inbound reverse-mode socket from `listener` within a bounded time
+/// budget, polling non-blockingly so the cancel flag is observed between
+/// attempts.
+///
+/// In reverse mode the device connects OUT to this desktop listener only after
+/// the scrcpy server has launched, so the first accept may find no peer
+/// waiting yet. The listener is put in non-blocking mode and polled up to
+/// [`REVERSE_ACCEPT_ATTEMPTS`] times with [`REVERSE_ACCEPT_BACKOFF`] between
+/// attempts (about the same ~2s budget as the forward-mode dummy-byte retry).
+/// A `WouldBlock` (no connection yet) is retried; any other accept error is
+/// returned immediately. When the budget is exhausted without a connection a
+/// [`std::io::ErrorKind::TimedOut`] error is returned so the caller can surface
+/// the captured server output instead of hanging. The accepted stream is put
+/// back into blocking mode before being returned.
+///
+/// A `true` from `should_cancel` aborts the wait early (returning a
+/// `TimedOut` error) so "Stop mirroring" tears down promptly instead of waiting
+/// out the full budget.
+fn accept_reverse_socket(
+    listener: &std::net::TcpListener,
+    should_cancel: &dyn Fn() -> bool,
+) -> std::io::Result<std::net::TcpStream> {
+    listener.set_nonblocking(true)?;
+    for attempt in 0..REVERSE_ACCEPT_ATTEMPTS {
+        if should_cancel() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "reverse-mode accept cancelled",
+            ));
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // Restore blocking mode so the subsequent header/stream reads
+                // behave like an ordinary socket (with their own read timeout).
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if attempt + 1 < REVERSE_ACCEPT_ATTEMPTS {
+                    std::thread::sleep(REVERSE_ACCEPT_BACKOFF);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "reverse-mode accept retries exhausted",
+    ))
+}
+
 /// Locate adb, auto-provisioning it if it cannot be found.
 ///
 /// First tries [`crate::adb::locate_or_provisioned`] (which prefers a bundled
@@ -558,7 +632,9 @@ fn connect_forward_video(addr: &str) -> std::io::Result<std::net::TcpStream> {
 /// rather than an opaque download error. The one-time download and the bundled
 /// adb execution are only reachable on the user's machine and are verified
 /// there; the headless host has no network guarantee and no adb.
-fn locate_or_provision_adb(status: &Sender<PipelineStatus>) -> Result<std::path::PathBuf, adb::AdbError> {
+fn locate_or_provision_adb(
+    status: &Sender<PipelineStatus>,
+) -> Result<std::path::PathBuf, adb::AdbError> {
     // Resolve the per-user data dir once; if it cannot be resolved, fall back
     // to the plain search (which still works when adb is already installed).
     let data_dir = crate::provision::data_dir().ok();
@@ -748,20 +824,53 @@ pub fn run_pipeline_full(
     }
     report(status, PipelineStatus::ServerPushed);
 
-    // 4. Set up the forward tunnel.
-    if let Err(e) = cmd.run(&adb::forward_args(
-        &selector,
-        config.local_port,
-        adb::SCRCPY_SOCKET_NAME,
-    )) {
-        teardown_with(&cmd, config, &selector);
-        report(status, PipelineStatus::Error(e.to_string()));
-        return Err(e);
-    }
-    report(status, PipelineStatus::Forwarded(config.local_port));
+    let tunnel_forward = config.server_opts.tunnel_forward;
 
-    // A stop requested after the forward is up but before launch: remove the
-    // forward we just added (teardown is best-effort) and report Stopped.
+    // 4. Set up the tunnel. In REVERSE mode (the shipped default) the desktop
+    //    MUST be listening BEFORE the device connects out, so bind the local
+    //    TcpListener first and only then run `adb reverse ...`; the device's
+    //    outbound connect would otherwise be refused. In FORWARD mode set up
+    //    `adb forward` and dial the socket later in run_stream.
+    let reverse_listener = if tunnel_forward {
+        if let Err(e) = cmd.run(&adb::forward_args(
+            &selector,
+            config.local_port,
+            adb::SCRCPY_SOCKET_NAME,
+        )) {
+            teardown_with(&cmd, config, &selector);
+            report(status, PipelineStatus::Error(e.to_string()));
+            return Err(e);
+        }
+        report(status, PipelineStatus::Forwarded(config.local_port));
+        None
+    } else {
+        // Bind the listener FIRST so the reverse tunnel points at a socket that
+        // is already accepting; otherwise the device's connect races the bind.
+        let bind_addr = format!("{}:{}", crate::connection::DEFAULT_HOST, config.local_port);
+        let listener = match std::net::TcpListener::bind(&bind_addr) {
+            Ok(l) => l,
+            Err(e) => {
+                let err = adb::AdbError::Io(e);
+                teardown_with(&cmd, config, &selector);
+                report(status, PipelineStatus::Error(err.to_string()));
+                return Err(err);
+            }
+        };
+        if let Err(e) = cmd.run(&adb::reverse_args(
+            &selector,
+            adb::SCRCPY_SOCKET_NAME,
+            config.local_port,
+        )) {
+            teardown_with(&cmd, config, &selector);
+            report(status, PipelineStatus::Error(e.to_string()));
+            return Err(e);
+        }
+        report(status, PipelineStatus::Forwarded(config.local_port));
+        Some(listener)
+    };
+
+    // A stop requested after the tunnel is up but before launch: remove the
+    // tunnel we just added (teardown is best-effort) and report Stopped.
     if is_cancelled(cancel) {
         teardown_with(&cmd, config, &selector);
         report(status, PipelineStatus::Stopped);
@@ -785,7 +894,13 @@ pub fn run_pipeline_full(
     spawn_server_output_reader(&mut server_child, &server_output);
     report(status, PipelineStatus::ServerLaunched);
 
-    // 6. Connect the forwarded socket(s) and run the scrcpy stream.
+    // 6. Acquire the video (and control) socket(s) and run the scrcpy stream.
+    //    Reverse mode accepts the device's inbound connections from the
+    //    listener; forward mode dials the forwarded local socket.
+    let source = match reverse_listener {
+        Some(listener) => VideoSource::ReverseListener(listener),
+        None => VideoSource::ForwardDial,
+    };
     let result = run_stream(
         config,
         status,
@@ -793,9 +908,10 @@ pub fn run_pipeline_full(
         control_sink.as_deref(),
         &server_output,
         cancel,
+        source,
     );
 
-    // Teardown: kill the server child and remove the forward.
+    // Teardown: kill the server child and remove the tunnel.
     let _ = server_child.kill();
     let _ = server_child.wait();
     teardown_with(&cmd, config, &selector);
@@ -804,23 +920,51 @@ pub fn run_pipeline_full(
     result
 }
 
-/// Connect the forwarded local socket(s) and pump scrcpy frames to the sink.
+/// How [`run_stream`] obtains the scrcpy video (and control) socket(s).
+///
+/// In the shipped REVERSE mode the desktop already bound a
+/// [`std::net::TcpListener`] (before `adb reverse`), and the device connects
+/// OUT to it, so run_stream accepts video then control from that listener and
+/// never consumes a forward-mode dummy byte. In the legacy FORWARD mode
+/// run_stream dials `127.0.0.1:<local_port>` and consumes the dummy byte, as
+/// before.
+enum VideoSource {
+    /// Reverse tunneling: accept the inbound sockets from this listener.
+    ReverseListener(std::net::TcpListener),
+    /// Forward tunneling: dial the forwarded local socket and consume the dummy
+    /// byte.
+    ForwardDial,
+}
+
+/// Acquire the scrcpy video (and control) socket(s) and pump frames to the sink.
 ///
 /// This is the SHIPPED v1 video path. The scrcpy server does NOT speak the
-/// FluxBridge 0xFB protocol on its sockets, so this connects a plain
-/// [`std::net::TcpStream`] to `127.0.0.1:local_port` and drives
-/// [`crate::scrcpy::stream_video`] (dummy byte, video header, length-prefixed
-/// H.264 access units) rather than [`crate::connection::Connection`] /
-/// [`crate::decode_loop::run_decode_loop`], which remain for a future
-/// FluxBridge-native server.
+/// FluxBridge 0xFB protocol on its sockets, so this drives a plain
+/// [`std::net::TcpStream`] through [`crate::scrcpy`] (video header,
+/// length-prefixed H.264 access units) rather than
+/// [`crate::connection::Connection`] / [`crate::decode_loop::run_decode_loop`],
+/// which remain for a future FluxBridge-native server.
+///
+/// How the sockets are obtained depends on `source`:
+///
+/// * [`VideoSource::ReverseListener`] (the shipped default): scrcpy uses reverse
+///   tunneling, so the device connects OUT to the desktop listener. The first
+///   accept is the VIDEO socket, the second is the CONTROL socket (audio is
+///   disabled, so there is no audio socket between them). Reverse mode sends NO
+///   leading dummy byte, so the dummy-byte consume is SKIPPED entirely; the very
+///   first bytes read are the 64-byte device name of the header.
+/// * [`VideoSource::ForwardDial`]: scrcpy uses forward tunneling, so the desktop
+///   dials `127.0.0.1:local_port` (video then control) and CONSUMES the leading
+///   dummy byte before parsing the header, exactly as before.
 ///
 /// When the server is launched with `control=true` (which the launch args
-/// always set), scrcpy accepts a SECOND connection on the same forwarded socket
-/// for the control channel. This opens that control socket and builds a
-/// [`crate::scrcpy::ScrcpyControlSink`] against it, sized to the device
-/// resolution from the parsed video header, so remote mouse/key/touch injection
-/// is a live, reachable path. The sink is returned through `control_sink` (when
-/// provided) so the UI input layer can drive it.
+/// always set), scrcpy exposes a SECOND socket for the control channel. This
+/// acquires that control socket and builds a [`crate::scrcpy::ScrcpyControlSink`]
+/// against it, sized to the device resolution from the parsed video header, so
+/// remote mouse/key/touch injection is a live, reachable path. The sink is
+/// returned through `control_sink` (when provided) so the UI input layer can
+/// drive it.
+#[allow(clippy::too_many_arguments)]
 fn run_stream(
     config: &PipelineConfig,
     status: &Sender<PipelineStatus>,
@@ -828,11 +972,12 @@ fn run_stream(
     control_sink: Option<&ControlSinkSlot>,
     server_output: &ServerOutputBuffer,
     cancel: Option<&CancelFlag>,
+    source: VideoSource,
 ) -> Result<(), adb::AdbError> {
     use std::net::TcpStream;
     use std::sync::mpsc;
 
-    // A stop requested before the socket is even dialed: return cleanly so the
+    // A stop requested before the socket is even acquired: return cleanly so the
     // caller runs kill-child + teardown exactly once.
     if is_cancelled(cancel) {
         return Ok(());
@@ -841,32 +986,84 @@ fn run_stream(
     let addr = format!("{}:{}", crate::connection::DEFAULT_HOST, config.local_port);
     let tunnel_forward = config.server_opts.tunnel_forward;
 
-    // First connection on the forwarded socket is the video stream. In
-    // tunnel-forward mode `adb forward` can accept this local connection before
-    // the device-side server is actually listening, so scrcpy's own client
-    // retries the connect. Mirror that with a bounded retry on connection
-    // refused; in reverse mode a single connect attempt is enough.
-    let mut video = if tunnel_forward {
-        match connect_forward_video(&addr) {
-            Ok(s) => s,
-            Err(e) => {
-                report(
-                    status,
-                    PipelineStatus::Error(stream_start_error(
-                        &format!("video socket {addr}: {e}"),
-                        snapshot_server_output_after_grace(server_output),
-                    )),
-                );
+    // Acquire the video socket and (optionally) the control socket per the
+    // tunnel mode. In reverse mode we accept the device's inbound connections
+    // from the listener (video first, then control); in forward mode we dial
+    // the forwarded local socket (with a bounded connect retry for the
+    // forward-mode readiness race) and open a second dial for control.
+    let (mut video, control) = match source {
+        VideoSource::ReverseListener(listener) => {
+            let cancelled = || is_cancelled(cancel);
+            // First inbound socket is the video stream.
+            let video = match accept_reverse_socket(&listener, &cancelled) {
+                Ok(s) => s,
+                Err(e) => {
+                    report(
+                        status,
+                        PipelineStatus::Error(stream_start_error(
+                            &format!("reverse video socket {addr}: {e}"),
+                            snapshot_server_output_after_grace(server_output),
+                        )),
+                    );
+                    return Ok(());
+                }
+            };
+            // A stop requested while we were waiting to accept video: return
+            // cleanly so teardown runs once.
+            if is_cancelled(cancel) {
                 return Ok(());
             }
+            // Second inbound socket is the control channel (control=true). A
+            // failure here is not fatal: video still streams without input
+            // injection, so it is reported but does not abort.
+            let control = match accept_reverse_socket(&listener, &cancelled) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    report(
+                        status,
+                        PipelineStatus::Error(format!(
+                            "reverse control socket {addr}: {e} (input disabled)"
+                        )),
+                    );
+                    None
+                }
+            };
+            (video, control)
         }
-    } else {
-        match TcpStream::connect(&addr) {
-            Ok(s) => s,
-            Err(e) => {
-                report(status, PipelineStatus::Error(format!("video socket {addr}: {e}")));
-                return Ok(());
-            }
+        VideoSource::ForwardDial => {
+            // First connection on the forwarded socket is the video stream. In
+            // tunnel-forward mode `adb forward` can accept this local connection
+            // before the device-side server is actually listening, so scrcpy's
+            // own client retries the connect. Mirror that with a bounded retry.
+            let video = match connect_forward_video(&addr) {
+                Ok(s) => s,
+                Err(e) => {
+                    report(
+                        status,
+                        PipelineStatus::Error(stream_start_error(
+                            &format!("video socket {addr}: {e}"),
+                            snapshot_server_output_after_grace(server_output),
+                        )),
+                    );
+                    return Ok(());
+                }
+            };
+            // Second connection is the scrcpy control channel. A failure here is
+            // not fatal to mirroring (video can still stream without input
+            // injection), so it is reported but does not abort.
+            let control = match TcpStream::connect(&addr) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    report(
+                        status,
+                        PipelineStatus::Error(format!(
+                            "control socket {addr}: {e} (input disabled)"
+                        )),
+                    );
+                    None
+                }
+            };
+            (video, control)
         }
     };
     // Use a SHORT read timeout (not the old 30s) so a blocked read on a stalled
@@ -877,21 +1074,6 @@ fn run_stream(
     // TimedOut error that stream_av_packets treats as a loop wake, not a fatal
     // error, so it re-checks the cancel flag and either continues or breaks.
     let _ = video.set_read_timeout(Some(STREAM_READ_TIMEOUT));
-
-    // Second connection is the scrcpy control channel (opened because the
-    // server is launched with control=true). A failure here is not fatal to
-    // mirroring: video can still stream without input injection, so it is
-    // reported but does not abort.
-    let control = match TcpStream::connect(&addr) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            report(
-                status,
-                PipelineStatus::Error(format!("control socket {addr}: {e} (input disabled)")),
-            );
-            None
-        }
-    };
 
     report(status, PipelineStatus::Streaming);
 
@@ -1097,13 +1279,20 @@ pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
     teardown_with(cmd, config, &config.selector());
 }
 
-/// Best-effort teardown against an explicit `selector`: remove the adb forward
-/// and (for Wi-Fi) disconnect.
+/// Best-effort teardown against an explicit `selector`: remove the adb tunnel
+/// (reverse or forward, matching the configured mode) and (for Wi-Fi)
+/// disconnect.
 ///
 /// Called on both the success and failure paths. Errors are ignored because
 /// teardown must not mask the original outcome. The `selector` is the RESOLVED
 /// serial for a Wi-Fi connection so the forward removed is the same one that
 /// was added.
+///
+/// Tunnel removal matches the tunnel mode that was actually set up: in the
+/// shipped REVERSE mode (`tunnel_forward=false`) it issues `adb reverse --remove
+/// localabstract:scrcpy`; in FORWARD mode it issues `adb forward --remove
+/// tcp:<local_port>`. Removing the wrong tunnel kind would leave the real one
+/// dangling, so the mode is read from `config.server_opts.tunnel_forward`.
 ///
 /// Wi-Fi disconnect: `adb disconnect <target>` is keyed on the connection
 /// ADDRESS, and the address this pipeline connected with is the mDNS
@@ -1118,7 +1307,12 @@ pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
 /// This cannot be exercised headlessly (no adb/device) and is finally verified
 /// by the user on the real Windows device.
 pub fn teardown_with(cmd: &AdbCommand, config: &PipelineConfig, selector: &DeviceSelector) {
-    let _ = cmd.run(&adb::forward_remove_args(selector, config.local_port));
+    // Remove the tunnel kind that was set up. Reverse is the shipped default.
+    if config.server_opts.tunnel_forward {
+        let _ = cmd.run(&adb::forward_remove_args(selector, config.local_port));
+    } else {
+        let _ = cmd.run(&adb::reverse_remove_args(selector, adb::SCRCPY_SOCKET_NAME));
+    }
     if let Transport::WiFi { ip, port } = &config.transport {
         let connect_addr = format!("{ip}:{port}");
         let _ = cmd.run(&adb::disconnect_args(ip, *port));
@@ -1566,6 +1760,191 @@ mod tests {
             ErrorKind::PermissionDenied,
             "x"
         )));
+    }
+
+    // --- Reverse tunneling (the shipped default) --------------------------
+
+    /// The shipped default is REVERSE tunneling: `ServerLaunchOptions::default`
+    /// must have `tunnel_forward=false` so the server never writes the
+    /// forward-mode leading dummy byte and the device connects out to the
+    /// desktop listener instead. This is the root-cause fix for the forward-mode
+    /// dummy-byte readiness race.
+    #[test]
+    fn default_server_opts_use_reverse_tunnel() {
+        assert!(
+            !ServerLaunchOptions::default().tunnel_forward,
+            "the shipped default must be reverse tunneling (tunnel_forward=false)"
+        );
+        let args = crate::adb::server_launch_args(
+            &DeviceSelector::UsbDefault,
+            &ServerLaunchOptions::default(),
+        );
+        assert!(
+            args.iter().any(|a| a == "tunnel_forward=false"),
+            "default launch args must request reverse tunneling, got {args:?}"
+        );
+    }
+
+    /// The reverse path drives a dummy-byte-FREE scrcpy stream off a loopback
+    /// TcpListener: a helper thread connects to the listener (as the device
+    /// would) and writes the scrcpy wire bytes with NO leading 0x00, and the
+    /// consumer accepts the socket, parses the header, and pumps the access
+    /// units through the shared loop to a sink.
+    ///
+    /// This FAILS if the reverse path wrongly expected/consumed a leading dummy
+    /// byte: the first byte read must be the first byte of the 64-byte device
+    /// name, not a 0x00. We prove this by making the device name's first byte a
+    /// non-zero ASCII char; if a dummy-byte consume were (wrongly) present it
+    /// would eat that byte and the header (and thus the whole stream) would be
+    /// misframed, so no access unit would reach the sink.
+    #[test]
+    fn reverse_path_parses_header_without_dummy_byte_and_pumps_a_packet() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+
+        // Build a scrcpy-style stream: 64-byte device name (NUL padded, first
+        // byte deliberately non-zero), codec id "h264", width, height, then one
+        // length-prefixed key-frame access unit. NO leading dummy byte.
+        let mut wire: Vec<u8> = Vec::new();
+        let mut name = [0u8; 64];
+        name[..6].copy_from_slice(b"SM-F94"); // non-zero first byte on purpose
+        wire.extend_from_slice(&name);
+        wire.extend_from_slice(&crate::scrcpy::fourcc(b"h264").to_be_bytes());
+        wire.extend_from_slice(&1080u32.to_be_bytes()); // width
+        wire.extend_from_slice(&1920u32.to_be_bytes()); // height
+                                                        // One access unit: 8-byte pts/flags header (key-frame flag set) + 4-byte
+                                                        // length + payload. A non-config unit so it is decoded and forwarded.
+        let payload = b"\x00\x00\x00\x01fakeNAL".to_vec();
+        let pts_flags: u64 = 1u64 << 62; // PACKET_FLAG_KEY_FRAME, not config
+        wire.extend_from_slice(&pts_flags.to_be_bytes());
+        wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&payload);
+
+        // Loopback listener: the desktop side binds and accepts, exactly as the
+        // reverse pipeline does before `adb reverse`.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+
+        // The "device" side connects out and writes the wire bytes.
+        let writer = std::thread::spawn(move || {
+            let mut sock = TcpStream::connect(addr).expect("device connects out");
+            sock.write_all(&wire).unwrap();
+            // Drop closes the socket so the consumer sees a clean EOF after the
+            // single access unit.
+        });
+
+        // Desktop side: accept the inbound video socket via the SAME bounded
+        // accept helper the pipeline uses, then drive the reverse stream.
+        let no_cancel = || false;
+        let mut video = accept_reverse_socket(&listener, &no_cancel).expect("accept video");
+
+        // Drive the dummy-byte-FREE reverse path: header parse + access-unit
+        // loop, mirroring what run_stream does in reverse mode. stream_video
+        // with tunnel_forward=false is the headless-testable equivalent and
+        // does NOT consume a dummy byte.
+        let (tx, rx) = mpsc::channel::<fluxbridge_core::DecodedFrame>();
+        let mut decoder = crate::decode_loop::StubDecoder::new();
+        let header = crate::scrcpy::stream_video(&mut video, false, &mut decoder, &tx)
+            .expect("reverse stream parses and runs to EOF without a dummy byte");
+
+        writer.join().unwrap();
+
+        // The header parsed correctly: proof no 0x00 was consumed ahead of it
+        // (a prepended dummy byte would have shifted every field and corrupted
+        // the device name / resolution).
+        assert_eq!(header.device_name, "SM-F94");
+        assert_eq!(header.width, 1080);
+        assert_eq!(header.height, 1920);
+
+        // At least one access unit reached the sink.
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            !frames.is_empty(),
+            "the reverse path must pump at least one access unit to the sink"
+        );
+    }
+
+    /// The reverse accept path is BOUNDED: when no peer ever connects within the
+    /// budget, the accept helper returns a TimedOut error instead of blocking
+    /// forever, and the pipeline turns that into the same actionable
+    /// stream-start error (with the preserved "Server said: ..." diagnostics)
+    /// used by the forward path. We drive it with a short cancel-triggered abort
+    /// so the test is fast rather than waiting out the full ~2s budget.
+    #[test]
+    fn reverse_accept_timeout_surfaces_stream_start_error_with_server_output() {
+        use std::net::TcpListener;
+
+        // A listener no one ever connects to (the failure case: the server
+        // never connected back).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+
+        // Abort the accept immediately via the cancel seam so we do not wait out
+        // the full budget; the helper returns a TimedOut error on abort.
+        let always_cancel = || true;
+        let err = accept_reverse_socket(&listener, &always_cancel)
+            .expect_err("accept with no peer must not succeed");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        // The pipeline wraps that into the shared stream_start_error with the
+        // captured server output, so the user still sees the diagnostics rather
+        // than a hang.
+        let server_output = ServerOutputBuffer::new();
+        server_output.push_line("[server] INFO: Device: [samsung] samsung SM-F946B (Android 17)");
+        let message = stream_start_error(
+            &format!("reverse video socket 127.0.0.1:27183: {err}"),
+            server_output.snapshot(SERVER_OUTPUT_LINES),
+        );
+        assert!(
+            message.contains("scrcpy stream did not start"),
+            "message must name the stream-start failure, got: {message}"
+        );
+        assert!(
+            message.contains("Server said"),
+            "message must preserve the Server said diagnostics, got: {message}"
+        );
+        assert!(message.contains("SM-F946B (Android 17)"));
+        assert!(!message.contains('\u{2014}'), "no em dashes");
+    }
+
+    /// Teardown must remove the tunnel kind that was actually set up. In the
+    /// shipped REVERSE mode (`tunnel_forward=false`) it issues `adb reverse
+    /// --remove localabstract:scrcpy`; it must NOT issue `adb forward --remove`
+    /// (which would leave the reverse tunnel dangling). We assert on the exact
+    /// arg vectors the removal helpers build for the configured mode.
+    #[test]
+    fn teardown_removes_reverse_tunnel_when_reverse_configured() {
+        // Reverse (default) mode.
+        let reverse_cfg = PipelineConfig::default();
+        assert!(!reverse_cfg.server_opts.tunnel_forward);
+        let sel = DeviceSelector::UsbDefault;
+        // The removal the reverse branch of teardown_with runs.
+        let reverse_remove = crate::adb::reverse_remove_args(&sel, crate::adb::SCRCPY_SOCKET_NAME);
+        assert_eq!(
+            reverse_remove,
+            vec!["reverse", "--remove", "localabstract:scrcpy"],
+            "reverse teardown must remove the reverse tunnel"
+        );
+        // It must differ from the forward removal (so the wrong one is not used).
+        let forward_remove = crate::adb::forward_remove_args(&sel, reverse_cfg.local_port);
+        assert_ne!(reverse_remove, forward_remove);
+
+        // Forward mode still removes the forward tunnel.
+        let forward_cfg = PipelineConfig {
+            server_opts: ServerLaunchOptions {
+                tunnel_forward: true,
+                ..ServerLaunchOptions::default()
+            },
+            ..PipelineConfig::default()
+        };
+        assert!(forward_cfg.server_opts.tunnel_forward);
+        assert_eq!(
+            crate::adb::forward_remove_args(&sel, forward_cfg.local_port),
+            vec![
+                "forward".to_string(),
+                "--remove".to_string(),
+                format!("tcp:{}", forward_cfg.local_port)
+            ]
+        );
     }
 
     #[test]
