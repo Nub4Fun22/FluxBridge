@@ -28,6 +28,17 @@ use std::sync::Arc;
 use crate::adb::{self, AdbCommand, DeviceSelector, ServerLaunchOptions};
 use crate::connection::ConnectionConfig;
 
+/// Read timeout on the scrcpy video socket.
+///
+/// Kept short (not the former 30s) so that on a STALLED stream a blocked read
+/// wakes roughly this often, letting the access-unit loop observe a "Stop
+/// mirroring" request and break out within about this interval instead of
+/// waiting out a long timeout. On a HEALTHY stream access units arrive
+/// continuously, so the timeout never actually fires and the short value has no
+/// throughput cost; a timed-out read at a packet boundary is treated as a loop
+/// wake (see [`crate::scrcpy::PacketRead::TimedOut`]), not an error.
+const STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A cooperative cancellation flag shared between the UI thread and the
 /// pipeline worker thread.
 ///
@@ -65,8 +76,12 @@ impl CancelFlag {
         self.flag.load(Ordering::SeqCst)
     }
 
-    /// Reset the flag back to NOT-cancelled, so the same flag can be reused for
-    /// a fresh pipeline run after a stop.
+    /// Reset the flag back to NOT-cancelled.
+    ///
+    /// The UI no longer reuses a single flag across runs (each run gets a FRESH
+    /// [`CancelFlag`] via [`RunGuard`], which is what removed the reset-on-Start
+    /// race). This is retained as a small utility on the primitive and is
+    /// covered by the flag-semantics test.
     pub fn reset(&self) {
         self.flag.store(false, Ordering::SeqCst);
     }
@@ -76,6 +91,84 @@ impl CancelFlag {
 /// build and callers that do not support stopping) is never cancelled.
 fn is_cancelled(cancel: Option<&CancelFlag>) -> bool {
     cancel.map(CancelFlag::is_cancelled).unwrap_or(false)
+}
+
+/// Single-threaded lifecycle guard for the mirroring pipeline, owned by the UI
+/// thread.
+///
+/// It bundles the two pieces of mirroring lifecycle state the UI must keep
+/// consistent so a fast Start-after-Stop cannot run two pipelines at once:
+///
+/// * a `started` guard that is true while a worker is live, and
+/// * the CURRENT run's [`CancelFlag`] (a FRESH flag per run, `None` when idle).
+///
+/// The critical invariants (regression-tested headlessly in this module):
+///
+/// * [`RunGuard::try_start`] gives out a fresh per-run flag and refuses to start
+///   a second run while one is still live, so Start cannot spawn an overlapping
+///   worker.
+/// * [`RunGuard::request_stop`] trips ONLY the current run's flag and is a safe
+///   no-op when idle, so Stop never cancels some later run by clearing a shared
+///   flag the previous worker had not yet observed.
+/// * [`RunGuard::worker_stopped`] is what releases the guard: the `started` flag
+///   is cleared (and the slot emptied) only when the worker actually signals
+///   termination (`PipelineStatus::Stopped`), NOT on the Stop click. Until then
+///   `try_start` keeps refusing, so the prior worker is guaranteed to have
+///   returned before the next Start proceeds.
+///
+/// Because the flag is a fresh per-run [`CancelFlag`] rather than one shared,
+/// reset-on-Start flag, there is no window where a reset clears a stop the old
+/// worker has not yet seen. It is deliberately NOT `Send`/`Sync`-bound beyond
+/// what `RefCell` allows: it lives on the UI thread and the only cross-thread
+/// handoff is the cloned [`CancelFlag`] passed into the worker.
+#[derive(Debug, Default)]
+pub struct RunGuard {
+    /// The current run's cancel flag, or `None` when no worker is live.
+    current: Option<CancelFlag>,
+}
+
+impl RunGuard {
+    /// A fresh, idle guard (no run in flight).
+    pub fn new() -> Self {
+        RunGuard { current: None }
+    }
+
+    /// Whether a worker is currently considered live (started and not yet
+    /// observed Stopped).
+    pub fn is_started(&self) -> bool {
+        self.current.is_some()
+    }
+
+    /// Attempt to begin a run. Returns a FRESH [`CancelFlag`] for the new run on
+    /// success, or `None` when a run is already live (so the caller must NOT
+    /// spawn an overlapping worker). The returned flag is stored as the current
+    /// run's flag so a later [`RunGuard::request_stop`] trips exactly this run.
+    pub fn try_start(&mut self) -> Option<CancelFlag> {
+        if self.current.is_some() {
+            return None;
+        }
+        let flag = CancelFlag::new();
+        self.current = Some(flag.clone());
+        Some(flag)
+    }
+
+    /// Request a stop of the CURRENT run, if any. Trips only the current run's
+    /// flag; a no-op when idle. Does NOT release the guard: the guard is freed
+    /// only once the worker signals termination via [`RunGuard::worker_stopped`],
+    /// which is what makes a Stop-then-Start sequence impossible to overlap.
+    pub fn request_stop(&self) {
+        if let Some(flag) = &self.current {
+            flag.cancel();
+        }
+    }
+
+    /// Mark the worker as terminated, releasing the guard so the next
+    /// [`RunGuard::try_start`] can proceed. Called when the UI observes
+    /// [`PipelineStatus::Stopped`] on the status channel (the worker emits it on
+    /// both the normal exit and the cancelled short-circuit). Idempotent.
+    pub fn worker_stopped(&mut self) {
+        self.current = None;
+    }
 }
 
 /// How the device is reached.
@@ -409,6 +502,7 @@ pub fn run_pipeline_full(
     }
     let selector = if let Transport::WiFi { ip, port } = &config.transport {
         if let Err(e) = cmd.run(&adb::connect_args(ip, *port)) {
+            // The connect itself failed, so nothing is registered to tear down.
             report(status, PipelineStatus::Error(e.to_string()));
             return Err(e);
         }
@@ -417,6 +511,12 @@ pub fn run_pipeline_full(
         let real_serial = match cmd.resolve_connected_serial(ip, *port) {
             Ok(s) => s,
             Err(e) => {
+                // The connect succeeded but adb never registered an online
+                // serial. Disconnect best-effort (teardown is idempotent) so we
+                // leave no half-open connection, THEN report the error so the
+                // UI's terminal Error arrives only after teardown has run and
+                // the worker is on its way out.
+                teardown_with(&cmd, config, &selector);
                 report(status, PipelineStatus::Error(e.to_string()));
                 return Err(e);
             }
@@ -443,8 +543,12 @@ pub fn run_pipeline_full(
     //    installed app finds the bundled jar regardless of its working dir.
     let server_jar = config.resolve_server_jar();
     if let Err(e) = cmd.run(&adb::push_server_args(&selector, &server_jar)) {
-        report(status, PipelineStatus::Error(e.to_string()));
+        // Tear down BEFORE reporting the terminal Error so the UI observes the
+        // Error only after teardown has run and the worker is returning; this
+        // keeps the lifecycle guard's release (on a terminal status) from
+        // freeing a Start while this worker is still tearing down.
         teardown_with(&cmd, config, &selector);
+        report(status, PipelineStatus::Error(e.to_string()));
         return Err(e);
     }
     report(status, PipelineStatus::ServerPushed);
@@ -455,8 +559,8 @@ pub fn run_pipeline_full(
         config.local_port,
         adb::SCRCPY_SOCKET_NAME,
     )) {
-        report(status, PipelineStatus::Error(e.to_string()));
         teardown_with(&cmd, config, &selector);
+        report(status, PipelineStatus::Error(e.to_string()));
         return Err(e);
     }
     report(status, PipelineStatus::Forwarded(config.local_port));
@@ -474,8 +578,8 @@ pub fn run_pipeline_full(
     {
         Ok(child) => child,
         Err(e) => {
-            report(status, PipelineStatus::Error(e.to_string()));
             teardown_with(&cmd, config, &selector);
+            report(status, PipelineStatus::Error(e.to_string()));
             return Err(e);
         }
     };
@@ -536,7 +640,14 @@ fn run_stream(
             return Ok(());
         }
     };
-    let _ = video.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    // Use a SHORT read timeout (not the old 30s) so a blocked read on a stalled
+    // stream wakes often enough for the access-unit loop to observe a Stop
+    // request promptly. On a healthy stream frames arrive continuously so the
+    // timeout never fires; on a stalled one it bounds Stop latency to roughly
+    // this interval instead of ~30s. A timed-out read surfaces as a WouldBlock /
+    // TimedOut error that stream_av_packets treats as a loop wake, not a fatal
+    // error, so it re-checks the cancel flag and either continues or breaks.
+    let _ = video.set_read_timeout(Some(STREAM_READ_TIMEOUT));
 
     // Second connection is the scrcpy control channel (opened because the
     // server is launched with control=true). A failure here is not fatal to
@@ -717,13 +828,45 @@ pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
 /// Called on both the success and failure paths. Errors are ignored because
 /// teardown must not mask the original outcome. The `selector` is the RESOLVED
 /// serial for a Wi-Fi connection so the forward removed is the same one that
-/// was added; the Wi-Fi `disconnect` still targets the original
-/// `ip:connect_port` the `adb connect` used.
+/// was added.
+///
+/// Wi-Fi disconnect: `adb disconnect <target>` is keyed on the connection
+/// ADDRESS, and the address this pipeline connected with is the mDNS
+/// `ip:connect_port` the `adb connect` used, so that is the primary disconnect
+/// target. However, Bug 4 showed that on Android 11+ TLS wireless debugging adb
+/// can REGISTER the device under a different serial (`ip:registered_port`) than
+/// the connect address. To make sure a successful connect leaves no orphaned
+/// entry regardless of which address adb kept, we ALSO disconnect the resolved
+/// serial when it differs from the connect address. Both calls are best-effort
+/// and idempotent (adb exits cleanly when the target is already gone), so the
+/// extra call is a safe no-op in the common case where the two addresses match.
+/// This cannot be exercised headlessly (no adb/device) and is finally verified
+/// by the user on the real Windows device.
 pub fn teardown_with(cmd: &AdbCommand, config: &PipelineConfig, selector: &DeviceSelector) {
     let _ = cmd.run(&adb::forward_remove_args(selector, config.local_port));
     if let Transport::WiFi { ip, port } = &config.transport {
+        let connect_addr = format!("{ip}:{port}");
         let _ = cmd.run(&adb::disconnect_args(ip, *port));
+        // Defensively drop the resolved serial too, when adb registered the
+        // device under a different address than we connected with.
+        if let DeviceSelector::Serial(serial) = selector {
+            if serial != &connect_addr {
+                if let Some((host, resolved_port)) = split_host_port(serial) {
+                    let _ = cmd.run(&adb::disconnect_args(host, resolved_port));
+                }
+            }
+        }
     }
+}
+
+/// Split a `host:port` adb serial into its host and numeric port, or `None` if
+/// it is not a `host:port` form (for example a plain USB serial). Used so
+/// teardown can disconnect a resolved Wi-Fi serial that differs from the
+/// connect address. Splits on the LAST colon so IPv6-style hosts are tolerated.
+fn split_host_port(serial: &str) -> Option<(&str, u16)> {
+    let (host, port) = serial.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    Some((host, port))
 }
 
 #[cfg(test)]
@@ -829,6 +972,24 @@ mod tests {
         assert_eq!(&forward[0..2], &["-s".to_string(), resolved.clone()]);
         let forward_remove = crate::adb::forward_remove_args(&sel, 27183);
         assert_eq!(&forward_remove[0..2], &["-s".to_string(), resolved.clone()]);
+    }
+
+    /// `split_host_port` recovers the host and port from a `host:port` Wi-Fi
+    /// serial (so teardown can defensively disconnect a resolved serial that
+    /// differs from the connect address) and returns `None` for a non-host:port
+    /// serial such as a USB device id.
+    #[test]
+    fn split_host_port_parses_wifi_serial_and_rejects_usb() {
+        assert_eq!(
+            split_host_port("192.168.1.42:42817"),
+            Some(("192.168.1.42", 42817))
+        );
+        // Splits on the last colon so an IPv6-style host is tolerated.
+        assert_eq!(split_host_port("fe80::1:5555"), Some(("fe80::1", 5555)));
+        // A plain USB serial has no port and must not parse.
+        assert_eq!(split_host_port("ZY223KLMNO"), None);
+        // A non-numeric port must not parse.
+        assert_eq!(split_host_port("192.168.1.42:notaport"), None);
     }
 
     #[test]
@@ -1066,6 +1227,70 @@ mod tests {
     #[test]
     fn cancel_flag_default_is_not_cancelled() {
         assert!(!CancelFlag::default().is_cancelled());
+    }
+
+    /// The lifecycle fix (review issues 1 and 2): a fresh per-run flag plus a
+    /// guard released only on worker termination makes Stop-then-Start
+    /// impossible to overlap.
+    ///
+    /// Start hands out a fresh flag and marks the run live; a SECOND start while
+    /// the first is still live is refused (None), so the UI cannot spawn an
+    /// overlapping worker. request_stop trips ONLY the current run's flag and
+    /// does NOT free the guard. The guard is freed only when the worker signals
+    /// termination (worker_stopped, driven by observing PipelineStatus::Stopped),
+    /// after which a new start succeeds with a DISTINCT flag that is NOT
+    /// cancelled by the previous Stop.
+    #[test]
+    fn run_guard_refuses_overlap_until_worker_stopped() {
+        let mut guard = RunGuard::new();
+        assert!(!guard.is_started(), "a fresh guard is idle");
+        // request_stop and worker_stopped are safe no-ops when idle.
+        guard.request_stop();
+        guard.worker_stopped();
+        assert!(!guard.is_started());
+
+        // First Start: get a fresh flag, run is now live.
+        let first = guard.try_start().expect("first start must succeed");
+        assert!(guard.is_started());
+        assert!(!first.is_cancelled(), "a fresh run flag is not cancelled");
+
+        // A second Start BEFORE the worker terminates is refused, so no
+        // overlapping worker can be spawned.
+        assert!(
+            guard.try_start().is_none(),
+            "a second start must be refused while a run is live"
+        );
+
+        // Stop trips ONLY the current run's flag; the guard stays live until the
+        // worker actually terminates.
+        guard.request_stop();
+        assert!(first.is_cancelled(), "stop must trip the current run's flag");
+        assert!(
+            guard.is_started(),
+            "the guard must NOT be released on the Stop click"
+        );
+        assert!(
+            guard.try_start().is_none(),
+            "a start after Stop but before Stopped is observed must still be refused"
+        );
+
+        // The worker terminates (PipelineStatus::Stopped observed) -> guard freed.
+        guard.worker_stopped();
+        assert!(!guard.is_started(), "worker_stopped releases the guard");
+
+        // Now a fresh Start succeeds with a DISTINCT flag that the earlier Stop
+        // did NOT cancel (no shared-flag reuse race).
+        let second = guard.try_start().expect("start after Stopped must succeed");
+        assert!(
+            !second.is_cancelled(),
+            "the new run's flag must be fresh, not cancelled by the earlier Stop"
+        );
+        // Tripping the old flag must not affect the new run, and vice versa.
+        first.cancel();
+        assert!(
+            !second.is_cancelled(),
+            "the previous run's flag must not cancel the current run"
+        );
     }
 
     /// The optional-flag helper treats `None` (headless / non-stoppable

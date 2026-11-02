@@ -125,20 +125,54 @@ pub fn parse_video_header<R: Read>(r: &mut R) -> io::Result<VideoHeader> {
     })
 }
 
+/// The outcome of attempting to read one access unit at a packet boundary.
+///
+/// Distinguishing a read timeout from end-of-stream matters for the cooperative
+/// stop: a short socket read timeout is set so the stream loop wakes to observe
+/// a Stop request, and a timeout that fires at a packet boundary (no bytes of
+/// the next packet consumed yet) is NOT an error or end of stream, it is just a
+/// wake so the loop can re-check the cancel flag and keep going.
+#[derive(Debug)]
+pub enum PacketRead {
+    /// A full access unit was read.
+    Packet(AvPacket),
+    /// The stream ended cleanly at a packet boundary.
+    Eof,
+    /// The read timed out at a packet boundary with no bytes consumed. The
+    /// caller should re-check its cancel flag and retry. Only produced when the
+    /// reader has a read timeout set (the live socket); the in-memory test
+    /// streams never time out.
+    TimedOut,
+}
+
+/// Whether an I/O error is a read-timeout wake (`WouldBlock` on Unix,
+/// `TimedOut` on Windows) rather than a real failure.
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
 /// Read one length-prefixed access unit from the video socket.
 ///
-/// Returns `Ok(None)` cleanly at end of stream (a zero-byte read where the next
-/// packet header would start).
-pub fn read_av_packet<R: Read>(r: &mut R) -> io::Result<Option<AvPacket>> {
+/// Returns [`PacketRead::Eof`] cleanly at end of stream (a zero-byte read where
+/// the next packet header would start) and [`PacketRead::TimedOut`] when a read
+/// timeout fires at a packet boundary before any byte of the next packet is
+/// consumed (so the caller can wake, re-check cancellation, and retry). Once the
+/// first bytes of a packet header have been read, a timeout mid-packet is still
+/// an error (a truncated packet), since partial framing cannot be resumed.
+pub fn read_av_packet<R: Read>(r: &mut R) -> io::Result<PacketRead> {
     let mut pts_buf = [0u8; 8];
-    if !read_full_or_eof(r, &mut pts_buf)? {
-        return Ok(None);
+    match read_full_or_eof(r, &mut pts_buf) {
+        Ok(true) => {}
+        Ok(false) => return Ok(PacketRead::Eof),
+        // A timeout at the very start of a packet is a wake, not a failure.
+        Err(ref e) if is_timeout(e) => return Ok(PacketRead::TimedOut),
+        Err(e) => return Err(e),
     }
     let pts_flags = u64::from_be_bytes(pts_buf);
     let len = r.read_u32::<BigEndian>()? as usize;
     let mut data = vec![0u8; len];
     r.read_exact(&mut data)?;
-    Ok(Some(AvPacket {
+    Ok(PacketRead::Packet(AvPacket {
         pts_us: pts_flags & PACKET_PTS_MASK,
         is_config: pts_flags & PACKET_FLAG_CONFIG != 0,
         is_keyframe: pts_flags & PACKET_FLAG_KEY_FRAME != 0,
@@ -277,8 +311,12 @@ pub fn stream_av_packets<R: Read>(
             return Ok(());
         }
         let packet = match read_av_packet(reader) {
-            Ok(Some(p)) => p,
-            Ok(None) => return Ok(()), // clean end of stream
+            Ok(PacketRead::Packet(p)) => p,
+            Ok(PacketRead::Eof) => return Ok(()), // clean end of stream
+            // A read timeout at a packet boundary is just a wake: loop back to
+            // re-check the cancel flag (above) so Stop is observed promptly on a
+            // stalled stream instead of waiting out the whole timeout.
+            Ok(PacketRead::TimedOut) => continue,
             Err(e) => {
                 return Err(fluxbridge_core::CoreError::Other(format!(
                     "scrcpy access unit: {e}"
@@ -644,20 +682,50 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(stream);
 
-        let p0 = read_av_packet(&mut cursor).unwrap().unwrap();
+        let p0 = match read_av_packet(&mut cursor).unwrap() {
+            PacketRead::Packet(p) => p,
+            other => panic!("expected a packet, got {other:?}"),
+        };
         assert!(p0.is_config);
         assert!(!p0.is_keyframe);
         assert_eq!(p0.pts_us, 0);
         assert_eq!(p0.data, vec![0x67, 0x42, 0x00]);
 
-        let p1 = read_av_packet(&mut cursor).unwrap().unwrap();
+        let p1 = match read_av_packet(&mut cursor).unwrap() {
+            PacketRead::Packet(p) => p,
+            other => panic!("expected a packet, got {other:?}"),
+        };
         assert!(!p1.is_config);
         assert!(p1.is_keyframe);
         assert_eq!(p1.pts_us, 1000);
         assert_eq!(p1.data, vec![0x65, 0x88, 0x84, 0x00]);
 
         // Clean end of stream.
-        assert!(read_av_packet(&mut cursor).unwrap().is_none());
+        assert!(
+            matches!(read_av_packet(&mut cursor).unwrap(), PacketRead::Eof),
+            "an exhausted cursor must read as a clean Eof"
+        );
+    }
+
+    /// A read timeout at a packet boundary (no bytes of the next packet
+    /// consumed) surfaces as [`PacketRead::TimedOut`], not an error or Eof, so
+    /// the stream loop can wake, re-check its cancel flag, and retry. This is
+    /// what bounds Stop latency on a stalled stream. A reader whose first read
+    /// returns `WouldBlock`/`TimedOut` stands in for the live socket's read
+    /// timeout firing with no data available.
+    #[test]
+    fn read_av_packet_reports_timeout_at_boundary_as_wake() {
+        struct TimingOutReader;
+        impl Read for TimingOutReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "read timed out"))
+            }
+        }
+        let mut r = TimingOutReader;
+        assert!(
+            matches!(read_av_packet(&mut r).unwrap(), PacketRead::TimedOut),
+            "a boundary timeout must be a wake, not an error or Eof"
+        );
     }
 
     #[test]

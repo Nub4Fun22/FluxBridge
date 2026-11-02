@@ -18,7 +18,7 @@ slint::include_modules!();
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
 
 use slint::ComponentHandle;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -221,7 +221,20 @@ pub fn build_main_window(
     let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>();
     // Channel the pipeline reports status/errors on.
     let (status_tx, status_rx) = mpsc::channel::<crate::pipeline::PipelineStatus>();
-    attach_pipeline_status(&window, status_rx);
+
+    // The mirroring lifecycle guard, owned on the UI thread. It holds the
+    // CURRENT run's cancel flag (a FRESH flag per run) and the started state.
+    // Start takes a fresh flag from it (refused while a run is live), Stop trips
+    // the current run's flag, and the guard is released only when the worker
+    // signals termination (PipelineStatus::Stopped observed below). Sharing one
+    // guard across the Start closure, the Stop closure, and the status timer is
+    // what makes a fast Start-after-Stop impossible to overlap.
+    let run_guard = Rc::new(RefCell::new(crate::pipeline::RunGuard::new()));
+
+    // The status timer drains PipelineStatus and, on Stopped, releases the guard
+    // so a subsequent Start can spawn a fresh pipeline only AFTER the prior
+    // worker has actually returned.
+    attach_pipeline_status(&window, status_rx, Rc::clone(&run_guard));
     attach_frame_sink(&window, frame_rx);
 
     // Shared slot the pipeline installs the scrcpy control sink into once the
@@ -233,27 +246,26 @@ pub fn build_main_window(
     // Start the adb-driven pipeline on a worker thread. Shared by the Start
     // button (USB / auto-reconnect transport from the config) and by the
     // wireless panel once it has paired/connected a device (an explicit Wi-Fi
-    // transport is passed in). A guard prevents spawning duplicate pipelines.
-    let started = Rc::new(Cell::new(false));
-    // Shared cooperative cancel flag: the UI trips it on Stop and the pipeline
-    // thread observes it to break its loop and run teardown exactly once. It is
-    // reset to NOT-cancelled before each spawn so a later Start runs fresh.
-    let cancel = crate::pipeline::CancelFlag::new();
+    // transport is passed in). The RunGuard refuses to spawn a second pipeline
+    // while one is still live (and until the prior worker has signalled
+    // termination), so duplicate/overlapping runs cannot happen.
     let pipeline_cfg = Arc::new(pipeline_cfg);
     let start_slot = Arc::clone(&control_slot);
     let start_status_tx = status_tx.clone();
     let start_frame_tx = frame_tx.clone();
     let start_pipeline: Rc<dyn Fn(Option<crate::pipeline::Transport>)> = {
-        let started = Rc::clone(&started);
+        let run_guard = Rc::clone(&run_guard);
         let pipeline_cfg = Arc::clone(&pipeline_cfg);
-        let cancel = cancel.clone();
         Rc::new(move |transport: Option<crate::pipeline::Transport>| {
-            if started.replace(true) {
-                // Already running; nothing more to spawn.
-                return;
-            }
-            // Clear any prior stop request so this fresh run is not cancelled.
-            cancel.reset();
+            // Take a FRESH per-run cancel flag. `None` means a run is still
+            // live (not yet observed Stopped), so we must NOT spawn an
+            // overlapping worker. Because each run gets its own flag, there is
+            // no shared flag to "reset" and therefore no window in which a reset
+            // could clear a stop the previous worker had not yet observed.
+            let cancel = match run_guard.borrow_mut().try_start() {
+                Some(flag) => flag,
+                None => return,
+            };
             // Clone the base config and override the transport when the wireless
             // panel supplies a freshly discovered Wi-Fi endpoint.
             let mut cfg = (*pipeline_cfg).clone();
@@ -264,7 +276,6 @@ pub fn build_main_window(
             let status = start_status_tx.clone();
             let frames = start_frame_tx.clone();
             let slot = Arc::clone(&start_slot);
-            let cancel = cancel.clone();
             std::thread::spawn(move || {
                 let _ = crate::pipeline::run_pipeline_full(
                     &cfg,
@@ -288,20 +299,23 @@ pub fn build_main_window(
     });
 
     // Stop mirroring: end the current session and return to the Start menu
-    // WITHOUT quitting the app (distinct from on_quit). Tripping the shared
-    // cancel flag makes the pipeline thread break its loop and run the existing
-    // teardown (forward --remove, kill the server child, Wi-Fi disconnect)
-    // exactly once; the thread self-exits when run_pipeline_full returns. This
-    // is idempotent and a safe no-op when nothing is mirroring. The UI is reset
-    // to the menu state (menu re-shown, video surface cleared) and `started` is
-    // released so a later Start spawns a fresh pipeline. Remembered devices are
-    // left untouched so reconnect stays quick.
+    // WITHOUT quitting the app (distinct from on_quit). Tripping ONLY the
+    // current run's cancel flag makes the pipeline thread break its loop and run
+    // the existing teardown (forward --remove, kill the server child, Wi-Fi
+    // disconnect) exactly once; the thread self-exits when run_pipeline_full
+    // returns and emits PipelineStatus::Stopped, which is what releases the
+    // RunGuard (in the status timer below). We deliberately do NOT clear the
+    // guard here: releasing it on worker termination rather than on this click
+    // is what guarantees a prior run has fully stopped before the next Start can
+    // spawn, so two pipelines can never contend for the same forward port and
+    // device. request_stop is idempotent and a safe no-op when not mirroring.
+    // The visible UI is reset to the menu state immediately so the user gets
+    // instant feedback; remembered devices are left untouched for quick
+    // reconnect.
     let weak = window.as_weak();
-    let stop_cancel = cancel.clone();
-    let stop_started = Rc::clone(&started);
+    let stop_guard = Rc::clone(&run_guard);
     window.on_stop_mirroring(move || {
-        stop_cancel.cancel();
-        stop_started.set(false);
+        stop_guard.borrow().request_stop();
         if let Some(w) = weak.upgrade() {
             w.set_menu_visible(true);
             // Clear the video surface so the placeholder shows again. An empty
@@ -546,6 +560,7 @@ fn wire_wireless_panel(
 pub fn attach_pipeline_status(
     window: &MainWindow,
     status_events: Receiver<crate::pipeline::PipelineStatus>,
+    run_guard: Rc<RefCell<crate::pipeline::RunGuard>>,
 ) {
     use crate::pipeline::PipelineStatus;
 
@@ -558,6 +573,16 @@ pub fn attach_pipeline_status(
         move || {
             let Some(w) = weak.upgrade() else { return };
             for status in events.try_iter() {
+                // The worker reached a TERMINAL state and has returned: Stopped
+                // (normal exit or the cancelled short-circuit) or Error (a
+                // failure path that returns Err without a further Stopped).
+                // Release the RunGuard HERE, not on the Stop click, so a new
+                // Start cannot spawn until the prior worker has fully torn down.
+                // Both are terminal for run_pipeline_full, so either one means
+                // the thread is on its way out.
+                if matches!(status, PipelineStatus::Stopped | PipelineStatus::Error(_)) {
+                    run_guard.borrow_mut().worker_stopped();
+                }
                 let is_error = matches!(status, PipelineStatus::Error(_));
                 w.set_pipeline_status(status.to_string().into());
                 w.set_pipeline_status_is_error(is_error);
