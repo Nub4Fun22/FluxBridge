@@ -1,6 +1,6 @@
 //! # fluxbridge-updater
 //!
-//! The in-app updater for [FluxBridge](https://github.com/fluxbridge/fluxbridge).
+//! The in-app updater for [FluxBridge](https://github.com/Nub4Fun22/FluxBridge).
 //! It checks the project's GitHub Releases for a newer version, downloads the
 //! platform asset with progress reporting, and applies the update by launching
 //! the downloaded installer and scheduling an application restart.

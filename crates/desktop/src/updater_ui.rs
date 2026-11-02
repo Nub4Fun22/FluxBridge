@@ -25,9 +25,9 @@ use fluxbridge_core::ReleaseInfo;
 use fluxbridge_updater::{ApplyOutcome, GithubUpdater, HttpTransport, UpdaterResult};
 
 /// Default GitHub owner for the FluxBridge releases.
-pub const GITHUB_OWNER: &str = "fluxbridge";
+pub const GITHUB_OWNER: &str = "Nub4Fun22";
 /// Default GitHub repository name for the FluxBridge releases.
-pub const GITHUB_REPO: &str = "fluxbridge";
+pub const GITHUB_REPO: &str = "FluxBridge";
 
 /// A message the background update worker sends back to the UI thread.
 #[derive(Debug, Clone, PartialEq, Eq)]

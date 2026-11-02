@@ -1,6 +1,6 @@
 //! # fluxbridge-core
 //!
-//! OS-agnostic core of [FluxBridge](https://github.com/fluxbridge/fluxbridge), a
+//! OS-agnostic core of [FluxBridge](https://github.com/Nub4Fun22/FluxBridge), a
 //! cross-platform desktop application for smartphone mirroring, remote control
 //! and advanced synchronization.
 //!
