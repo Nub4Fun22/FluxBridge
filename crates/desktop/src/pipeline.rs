@@ -540,18 +540,20 @@ fn is_retryable_connect_error(e: &std::io::Error) -> bool {
     )
 }
 
-/// Whether an [`adb::AdbError`] from a `connect`/accept step looks like a
+/// Whether an [`adb::AdbError`] from the Wi-Fi `adb connect` step looks like a
 /// connection-class failure that a one-time adb daemon restart might clear,
 /// rather than a hard configuration error.
 ///
 /// This is the decision half of the FAILURE-path daemon hygiene: a stale or
-/// wedged adb daemon can make `adb connect` fail or the reverse-mode accept
-/// time out, and bouncing the daemon once can recover it. We treat as
+/// wedged adb daemon is a common cause of a failed `adb connect`, and bouncing
+/// the daemon once can recover it. It gates ONLY the Wi-Fi connect recovery in
+/// [`run_pipeline_full`]; the reverse-mode accept is a plain loopback TCP accept
+/// that never talks to the adb daemon, so an accept timeout is NOT recovered by
+/// bouncing it and this helper is not consulted there. We treat as
 /// connection-class:
 ///
 /// * [`adb::AdbError::Io`] whose underlying kind is one of the transient
-///   connection kinds (refused/reset/aborted/timed-out), which also covers the
-///   reverse-mode accept timeout (a `TimedOut` I/O error); and
+///   connection kinds (refused/reset/aborted/timed-out); and
 /// * [`adb::AdbError::Command`] from adb exiting non-zero, which is how a failed
 ///   `adb connect` surfaces (adb prints the failure to stderr and exits 1).
 ///
@@ -641,9 +643,13 @@ fn connect_forward_video(addr: &str) -> std::io::Result<std::net::TcpStream> {
 /// the captured server output instead of hanging. The accepted stream is put
 /// back into blocking mode before being returned.
 ///
-/// A `true` from `should_cancel` aborts the wait early (returning a
-/// `TimedOut` error) so "Stop mirroring" tears down promptly instead of waiting
-/// out the full budget.
+/// A `true` from `should_cancel` aborts the wait early. Cancellation is
+/// distinguished from budget exhaustion by its error kind: a cancel returns
+/// [`std::io::ErrorKind::Interrupted`] (a Stop was requested, NOT a server
+/// failure) while budget exhaustion returns [`std::io::ErrorKind::TimedOut`].
+/// The caller treats the `Interrupted` case as a clean Stop (no error status),
+/// so "Stop mirroring" tears down promptly instead of surfacing a spurious
+/// "retries exhausted" server failure.
 fn accept_reverse_socket(
     listener: &std::net::TcpListener,
     should_cancel: &dyn Fn() -> bool,
@@ -652,7 +658,7 @@ fn accept_reverse_socket(
     for attempt in 0..REVERSE_ACCEPT_ATTEMPTS {
         if should_cancel() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
+                std::io::ErrorKind::Interrupted,
                 "reverse-mode accept cancelled",
             ));
         }
@@ -726,7 +732,10 @@ fn locate_or_provision_adb(
             report(status, PipelineStatus::ExtractingAdb);
         }
         crate::provision::ProvisionProgress::Done(path) => {
-            report(status, PipelineStatus::AdbProvisioned(path.display().to_string()));
+            report(
+                status,
+                PipelineStatus::AdbProvisioned(path.display().to_string()),
+            );
         }
     };
 
@@ -1088,6 +1097,14 @@ fn run_stream(
             let video = match accept_reverse_socket(&listener, &cancelled) {
                 Ok(s) => s,
                 Err(e) => {
+                    // A Stop requested during the accept wait returns cleanly,
+                    // NOT as an error: mirror the forward dummy-byte path by
+                    // checking the cancel flag BEFORE reporting so a Stop never
+                    // surfaces the "reverse video socket ... retries exhausted"
+                    // text as a spurious server failure.
+                    if is_cancelled(cancel) {
+                        return Ok(());
+                    }
                     report(
                         status,
                         PipelineStatus::Error(stream_start_error(
@@ -1108,6 +1125,12 @@ fn run_stream(
             // injection, so it is reported but does not abort.
             let control = match accept_reverse_socket(&listener, &cancelled) {
                 Ok(s) => Some(s),
+                // A Stop requested during the control-accept wait is a clean
+                // teardown, not an input-disabled failure: skip the report on
+                // cancel so no spurious "reverse control socket ... cancelled"
+                // status reaches the user. The subsequent cancel check below
+                // returns cleanly.
+                Err(_) if is_cancelled(cancel) => None,
                 Err(e) => {
                     report(
                         status,
@@ -1118,6 +1141,11 @@ fn run_stream(
                     None
                 }
             };
+            // A stop requested while we were waiting to accept control: return
+            // cleanly so teardown runs once.
+            if is_cancelled(cancel) {
+                return Ok(());
+            }
             (video, control)
         }
         VideoSource::ForwardDial => {
@@ -1179,9 +1207,7 @@ fn run_stream(
         }
     };
     if let Some(rx) = local_rx {
-        std::thread::spawn(move || {
-            for _ in rx.iter() {}
-        });
+        std::thread::spawn(move || for _ in rx.iter() {});
     }
 
     // The real decode path links FFmpeg behind the `decode` feature. Without it
@@ -1788,7 +1814,8 @@ mod tests {
     #[test]
     fn stream_start_error_reports_no_output_when_buffer_empty() {
         let empty = ServerOutputBuffer::new();
-        let message = stream_start_error("dummy byte: timeout", empty.snapshot(SERVER_OUTPUT_LINES));
+        let message =
+            stream_start_error("dummy byte: timeout", empty.snapshot(SERVER_OUTPUT_LINES));
         assert!(message.contains("(no output captured)"), "{message}");
         assert!(message.contains("Wireless debugging"));
         assert!(!message.contains('\u{2014}'));
@@ -1856,10 +1883,16 @@ mod tests {
 
     /// A failed `adb connect` surfaces as `AdbError::Command` (adb exits
     /// non-zero), which is connection-class so a one-time daemon bounce is
-    /// permitted. The reverse-mode accept timeout surfaces as an `AdbError::Io`
-    /// with a `TimedOut` kind, which is also connection-class. A missing adb
-    /// (`NotFound`) is NOT connection-class: restarting the daemon cannot make
-    /// the binary appear, so recovery must be declined.
+    /// permitted. A transient connection-kind I/O error (refused/reset/
+    /// aborted/timed-out) from the `adb connect` step is likewise
+    /// connection-class. A missing adb (`NotFound`) is NOT connection-class:
+    /// restarting the daemon cannot make the binary appear, so recovery must be
+    /// declined.
+    ///
+    /// NOTE: this classification gates ONLY the Wi-Fi `adb connect` recovery;
+    /// the reverse-mode accept is a plain loopback TCP accept that never
+    /// consults `is_connection_class_error`, so no assertion here implies the
+    /// accept timeout is daemon-recovered (it is not).
     #[test]
     fn connection_class_error_classification() {
         use std::io::{Error, ErrorKind};
@@ -1871,15 +1904,15 @@ mod tests {
             stderr: "failed to connect".into(),
         }));
 
-        // The reverse-mode accept timing out.
-        assert!(is_connection_class_error(&adb::AdbError::Io(Error::new(
-            ErrorKind::TimedOut,
-            "reverse-mode accept retries exhausted"
-        ))));
-        // A connection-refused I/O error is likewise connection-class.
+        // A connection-refused I/O error from `adb connect` is connection-class.
         assert!(is_connection_class_error(&adb::AdbError::Io(Error::new(
             ErrorKind::ConnectionRefused,
             "x"
+        ))));
+        // A timed-out I/O error from `adb connect` is likewise connection-class.
+        assert!(is_connection_class_error(&adb::AdbError::Io(Error::new(
+            ErrorKind::TimedOut,
+            "connect timed out"
         ))));
 
         // A non-connection I/O error is not.
@@ -1920,7 +1953,10 @@ mod tests {
         // genuine connection failure afterwards can still recover exactly once.
         let mut gate = DaemonRecovery::new();
         let not_conn = adb::AdbError::Io(Error::new(ErrorKind::PermissionDenied, "x"));
-        assert!(!gate.allow(&not_conn), "non-connection errors never recover");
+        assert!(
+            !gate.allow(&not_conn),
+            "non-connection errors never recover"
+        );
         assert!(!gate.allow(&not_conn));
         assert!(
             gate.allow(&conn()),
@@ -2031,26 +2067,113 @@ mod tests {
         );
     }
 
+    /// Cancellation during the reverse accept window is NOT a server failure: a
+    /// Stop requested while the device has not yet connected back must surface
+    /// as a clean teardown, never as a spurious "retries exhausted" error. The
+    /// accept helper distinguishes the two by error kind: a cancel returns
+    /// `Interrupted` (so the call site returns cleanly without reporting), while
+    /// budget exhaustion returns `TimedOut` (the real failure the user should
+    /// see). This test pins that distinction, which is the behavioral contract
+    /// the `run_stream` reverse call site relies on to skip the error report on
+    /// cancel.
+    #[test]
+    fn reverse_accept_cancel_is_interrupted_not_timeout() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+
+        // A Stop requested during the accept wait: the helper returns
+        // Interrupted, the signal the call site treats as a clean cancel (NOT a
+        // TimedOut server failure). It aborts on the first poll, so this is
+        // fast and never waits out the budget.
+        let always_cancel = || true;
+        let err = accept_reverse_socket(&listener, &always_cancel)
+            .expect_err("a cancelled accept must not succeed");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "a cancel must surface as Interrupted so the call site returns cleanly, \
+             not as a TimedOut server failure"
+        );
+    }
+
+    /// End-to-end: a Stop requested during the reverse video-accept window
+    /// drives `run_stream` to a CLEAN return with NO `PipelineStatus::Error`.
+    /// This is the regression the review flagged: previously the accept helper
+    /// returned a `TimedOut` on cancel and the call site reported a spurious
+    /// "reverse video socket ... retries exhausted" error BEFORE re-checking the
+    /// cancel flag. With the fix the call site returns cleanly on cancel, so no
+    /// error status is ever sent. We bind a listener no peer connects to and
+    /// pre-trip the cancel flag, exactly the Stop-while-waiting case.
+    #[test]
+    fn run_stream_reverse_cancel_reports_no_error() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let cfg = PipelineConfig {
+            local_port: port,
+            server_opts: ServerLaunchOptions {
+                tunnel_forward: false,
+                ..ServerLaunchOptions::default()
+            },
+            ..PipelineConfig::default()
+        };
+
+        // A cancel flag already tripped: the Stop landed while we were waiting
+        // for the device to connect back.
+        let flag = CancelFlag::new();
+        flag.cancel();
+
+        let (tx, rx) = mpsc::channel::<PipelineStatus>();
+        let server_output = ServerOutputBuffer::new();
+        let result = run_stream(
+            &cfg,
+            &tx,
+            None,
+            None,
+            &server_output,
+            Some(&flag),
+            VideoSource::ReverseListener(listener),
+        );
+        drop(tx);
+
+        assert!(result.is_ok(), "a cancelled reverse accept returns cleanly");
+
+        // No Error status must have been emitted: a Stop is a clean teardown.
+        let statuses: Vec<_> = rx.iter().collect();
+        assert!(
+            !statuses
+                .iter()
+                .any(|s| matches!(s, PipelineStatus::Error(_))),
+            "a Stop during reverse accept must NOT surface an Error status, got: {statuses:?}"
+        );
+    }
+
     /// The reverse accept path is BOUNDED: when no peer ever connects within the
-    /// budget, the accept helper returns a TimedOut error instead of blocking
-    /// forever, and the pipeline turns that into the same actionable
-    /// stream-start error (with the preserved "Server said: ..." diagnostics)
-    /// used by the forward path. We drive it with a short cancel-triggered abort
-    /// so the test is fast rather than waiting out the full ~2s budget.
+    /// budget, the accept helper returns a `TimedOut` error (distinct from the
+    /// `Interrupted` cancel case) instead of blocking forever, and the pipeline
+    /// turns that into the same actionable stream-start error (with the
+    /// preserved "Server said: ..." diagnostics) used by the forward path. This
+    /// drives the REAL budget-exhaustion path (no cancel), so it waits out the
+    /// bounded ~2s budget rather than faking the timeout.
     #[test]
     fn reverse_accept_timeout_surfaces_stream_start_error_with_server_output() {
         use std::net::TcpListener;
 
         // A listener no one ever connects to (the failure case: the server
-        // never connected back).
+        // never connected back). No cancel, so the helper exhausts its bounded
+        // budget and returns a genuine TimedOut.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-
-        // Abort the accept immediately via the cancel seam so we do not wait out
-        // the full budget; the helper returns a TimedOut error on abort.
-        let always_cancel = || true;
-        let err = accept_reverse_socket(&listener, &always_cancel)
+        let no_cancel = || false;
+        let err = accept_reverse_socket(&listener, &no_cancel)
             .expect_err("accept with no peer must not succeed");
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "budget exhaustion must surface as TimedOut (the real server failure)"
+        );
 
         // The pipeline wraps that into the shared stream_start_error with the
         // captured server output, so the user still sees the diagnostics rather
@@ -2231,7 +2354,10 @@ mod tests {
         // Stop trips ONLY the current run's flag; the guard stays live until the
         // worker actually terminates.
         guard.request_stop();
-        assert!(first.is_cancelled(), "stop must trip the current run's flag");
+        assert!(
+            first.is_cancelled(),
+            "stop must trip the current run's flag"
+        );
         assert!(
             guard.is_started(),
             "the guard must NOT be released on the Stop click"
@@ -2316,7 +2442,13 @@ mod tests {
         let resolved = DeviceSelector::Serial("192.168.1.42:42817".into());
         assert_eq!(
             adb::forward_remove_args(&resolved, wifi_cfg.local_port),
-            vec!["-s", "192.168.1.42:42817", "forward", "--remove", "tcp:27183"]
+            vec![
+                "-s",
+                "192.168.1.42:42817",
+                "forward",
+                "--remove",
+                "tcp:27183"
+            ]
         );
         assert_eq!(
             adb::disconnect_args("192.168.1.42", 37000),
