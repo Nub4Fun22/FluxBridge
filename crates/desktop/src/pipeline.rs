@@ -35,9 +35,31 @@ pub enum Transport {
     WiFi {
         /// Device IP address.
         ip: String,
-        /// Device adb TCP/IP port (typically 5555).
+        /// Device adb connect port. For Android 11+ wireless debugging this is
+        /// the DYNAMIC `_adb-tls-connect._tcp` port discovered via mDNS (see
+        /// [`crate::adb::parse_mdns_services`]), NOT the legacy fixed 5555 used
+        /// after `adb tcpip`. Use [`Transport::wifi`] /
+        /// [`Transport::from_wireless`] so the discovered port flows through
+        /// instead of a hardcoded value.
         port: u16,
     },
+}
+
+impl Transport {
+    /// A Wi-Fi transport for a device reached at `host:connect_port`, where
+    /// `connect_port` is the mDNS-discovered (dynamic) connect port.
+    pub fn wifi(host: impl Into<String>, connect_port: u16) -> Self {
+        Transport::WiFi {
+            ip: host.into(),
+            port: connect_port,
+        }
+    }
+
+    /// A Wi-Fi transport built from a completed wireless pair/connect result,
+    /// carrying its discovered connect host and port into the pipeline.
+    pub fn from_wireless(conn: &crate::adb::WirelessConnection) -> Self {
+        Transport::wifi(conn.host.clone(), conn.connect_port)
+    }
 }
 
 /// Inputs needed to start the mirroring pipeline.
@@ -130,6 +152,13 @@ pub enum PipelineStatus {
     ExtractingAdb,
     /// adb was auto-provisioned (downloaded + extracted) at the given path.
     AdbProvisioned(String),
+    /// Browsing the LAN for wireless-debugging devices via adb's mDNS.
+    Discovering,
+    /// Pairing with a device using the 6-digit code shown on the phone; carries
+    /// the `host:port` pairing endpoint.
+    Pairing(String),
+    /// The one-time pairing with the device succeeded.
+    Paired(String),
     /// A Wi-Fi `adb connect` to the device succeeded.
     Connected(String),
     /// The scrcpy server jar was pushed to the device.
@@ -155,6 +184,9 @@ impl fmt::Display for PipelineStatus {
             }
             PipelineStatus::ExtractingAdb => write!(f, "Extracting Android platform-tools..."),
             PipelineStatus::AdbProvisioned(p) => write!(f, "adb installed at {p}"),
+            PipelineStatus::Discovering => write!(f, "searching for wireless devices..."),
+            PipelineStatus::Pairing(s) => write!(f, "pairing with {s}..."),
+            PipelineStatus::Paired(s) => write!(f, "paired with {s}"),
             PipelineStatus::Connected(s) => write!(f, "connected to {s}"),
             PipelineStatus::ServerPushed => write!(f, "server pushed to device"),
             PipelineStatus::Forwarded(p) => write!(f, "forwarding 127.0.0.1:{p}"),
@@ -589,6 +621,34 @@ mod tests {
         );
     }
 
+    /// A Wi-Fi transport built from an mDNS-DISCOVERED connect endpoint (a
+    /// dynamic port, not the legacy 5555) routes through the same path as USB:
+    /// its selector is the `host:connect_port` serial and `adb connect` targets
+    /// exactly that discovered host:port.
+    #[test]
+    fn wifi_from_discovered_connect_port_yields_serial_and_connect_args() {
+        let wc = crate::adb::WirelessConnection {
+            host: "192.168.1.42".into(),
+            connect_port: 37000, // dynamic mDNS connect port, NOT 5555
+        };
+        let cfg = PipelineConfig {
+            transport: Transport::from_wireless(&wc),
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            cfg.selector(),
+            DeviceSelector::Serial("192.168.1.42:37000".into())
+        );
+        if let Transport::WiFi { ip, port } = &cfg.transport {
+            assert_eq!(
+                crate::adb::connect_args(ip, *port),
+                vec!["connect", "192.168.1.42:37000"]
+            );
+        } else {
+            panic!("expected a Wi-Fi transport");
+        }
+    }
+
     #[test]
     fn connection_config_points_at_local_forward() {
         let cfg = PipelineConfig {
@@ -771,6 +831,24 @@ mod tests {
         assert_eq!(
             PipelineStatus::AdbProvisioned("/data/platform-tools/adb".into()).to_string(),
             "adb installed at /data/platform-tools/adb"
+        );
+    }
+
+    /// The wireless discovery/pairing status variants render human-readable
+    /// text for the UI status line.
+    #[test]
+    fn wireless_status_display_is_human_readable() {
+        assert_eq!(
+            PipelineStatus::Discovering.to_string(),
+            "searching for wireless devices..."
+        );
+        assert_eq!(
+            PipelineStatus::Pairing("192.168.1.42:41355".into()).to_string(),
+            "pairing with 192.168.1.42:41355..."
+        );
+        assert_eq!(
+            PipelineStatus::Paired("192.168.1.42:37000".into()).to_string(),
+            "paired with 192.168.1.42:37000"
         );
     }
 }

@@ -14,12 +14,12 @@
 //! tested. See `README.md` for why Slint is gated behind a feature.
 
 // This is a scaffold binary. Several public items are intentional
-// forward-looking API that later milestones wire up: the reconnect loop and
-// mDNS auto-pairing hook (Phase 2), outbound packet `send`, and (in the
-// headless build) the full update download/apply flow which the Slint UI drives
-// only under the `gui` feature. They are all exercised by the unit tests. Allow
-// dead_code so both the default and `gui` builds stay warning-clean without
-// deleting documented API the roadmap depends on.
+// forward-looking API that later milestones wire up: the reconnect loop,
+// outbound packet `send`, and (in the headless build) the full update
+// download/apply flow which the Slint UI drives only under the `gui` feature.
+// They are all exercised by the unit tests. Allow dead_code so both the default
+// and `gui` builds stay warning-clean without deleting documented API the
+// roadmap depends on.
 #![allow(dead_code)]
 // Suppress the console window for the release Windows GUI build only. The
 // headless Linux build (no `gui` feature) and debug builds are unaffected, so
@@ -32,6 +32,7 @@
 
 mod adb;
 mod connection;
+mod devices;
 mod decode_loop;
 mod pipeline;
 mod provision;
@@ -97,17 +98,59 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Derive a [`PipelineConfig`] from the resolved connection target. A bare
-/// default target means USB; an explicit non-loopback host means Wi-Fi.
+/// Derive a [`PipelineConfig`] from the resolved connection target.
+///
+/// Resolution order:
+///
+/// 1. An explicit non-loopback `host:port` CLI target means Wi-Fi to exactly
+///    that address (the user asked for it, so it wins). The port is taken from
+///    the target, NOT hardcoded to the legacy 5555, so an mDNS connect port
+///    passed on the command line flows through.
+/// 2. Otherwise, if a device was remembered from a previous wireless pairing
+///    ([`devices`]) and can be silently re-reached with `adb connect`, use it
+///    so a returning user is automatic. See [`auto_reconnect_transport`].
+/// 3. Otherwise fall back to USB (and, when the user opens the pairing UX in
+///    the GUI, the mDNS discover + one-time-code pair flow).
 fn pipeline_config_from(config: &ConnectionConfig) -> PipelineConfig {
     let mut cfg = PipelineConfig::default();
     if config.host != connection::DEFAULT_HOST && !config.host.is_empty() {
-        cfg.transport = pipeline::Transport::WiFi {
-            ip: config.host.clone(),
-            port: 5555,
-        };
+        cfg.transport = pipeline::Transport::wifi(config.host.clone(), config.port);
+        return cfg;
+    }
+    if let Some(transport) = auto_reconnect_transport() {
+        cfg.transport = transport;
     }
     cfg
+}
+
+/// Try to silently re-reach the most recently paired wireless device.
+///
+/// A returning user who paired a phone once (the one-time 6-digit-code step)
+/// should not have to do anything on the next launch. This loads the remembered
+/// devices ([`devices::KnownDevices`]) and, for the most-recently-used one,
+/// runs `adb connect <host>:<connect_port>` on its remembered endpoint. On
+/// success it returns a [`pipeline::Transport::WiFi`] carrying that device's
+/// DISCOVERED connect port (never a hardcoded 5555) so the normal
+/// push/forward/launch/stream pipeline mirrors it.
+///
+/// Returns `None` (so the caller falls through to USB / the pairing UX) when
+/// adb is not available, no device is remembered, or the `adb connect` fails
+/// (the phone moved networks, is off, or Wireless debugging is disabled). It
+/// deliberately does NOT provision adb or block on mDNS rediscovery here; it is
+/// a fast best-effort attempt at startup. All of adb connect, mDNS, and the
+/// first pairing require a real device and are verified by the user on Windows.
+fn auto_reconnect_transport() -> Option<pipeline::Transport> {
+    let data_dir = provision::data_dir().ok()?;
+    let adb_path = adb::locate_or_provisioned(&data_dir).ok()?;
+
+    let known = devices::KnownDevices::load(&devices::devices_path(&data_dir));
+    let device = known.most_recent()?;
+
+    let cmd = adb::AdbCommand::with_path(adb_path, adb::DeviceSelector::UsbDefault);
+    match cmd.connect_discovered(&device.host, device.connect_port) {
+        Ok(conn) => Some(pipeline::Transport::from_wireless(&conn)),
+        Err(_) => None,
+    }
 }
 
 #[cfg(not(feature = "gui"))]
@@ -123,6 +166,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match update_rx.try_recv() {
         Ok(event) => println!("update check: {event:?}"),
         Err(_) => println!("update check: no result (offline is fine for the scaffold)"),
+    }
+
+    // Attempt a silent auto-reconnect to a remembered wireless device before
+    // falling back to USB. On this headless build (no adb/device) this is a
+    // no-op that we simply log; on the user's machine it makes a returning
+    // paired phone one-click.
+    match auto_reconnect_transport() {
+        Some(pipeline::Transport::WiFi { ip, port }) => {
+            println!("auto-reconnect: reusing remembered wireless device {ip}:{port}");
+        }
+        _ => println!("auto-reconnect: no remembered wireless device reachable (USB fallback)"),
     }
 
     // Attempt the real adb-driven pipeline. On the headless CLI build it is

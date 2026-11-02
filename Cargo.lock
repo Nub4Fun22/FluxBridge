@@ -1165,6 +1165,8 @@ dependencies = [
  "fluxbridge-core",
  "fluxbridge-updater",
  "png 0.17.16",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "zip",

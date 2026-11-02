@@ -34,6 +34,13 @@ directories = "5"
 # pure-Rust dependency. The HTTP download REUSES the fluxbridge-updater
 # UreqTransport (already a dependency); no new HTTP crate is added.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Serialize the remembered paired-device list to a small JSON file in the app
+# data dir (crates/desktop/src/devices.rs) so a returning user auto-reconnects
+# over Wi-Fi without re-pairing. Both are pure Rust (already in the workspace
+# dependency set) and add no native linkage, so they are safe NORMAL deps in
+# the default headless build.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Slint is optional and OFF by default. The headless Linux CI host has no
 # display server and no guarantee of the system GUI libraries Slint's backends
 # need, so the default build compiles all the pure-Rust logic (connection,
