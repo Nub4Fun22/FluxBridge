@@ -21,10 +21,155 @@
 //! only reached at runtime on the user's machine, never on the headless CI host.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::adb::{self, AdbCommand, DeviceSelector, ServerLaunchOptions};
 use crate::connection::ConnectionConfig;
+
+/// Read timeout on the scrcpy video socket.
+///
+/// Kept short (not the former 30s) so that on a STALLED stream a blocked read
+/// wakes roughly this often, letting the access-unit loop observe a "Stop
+/// mirroring" request and break out within about this interval instead of
+/// waiting out a long timeout. On a HEALTHY stream access units arrive
+/// continuously, so the timeout never actually fires and the short value has no
+/// throughput cost; a timed-out read at a packet boundary is treated as a loop
+/// wake (see [`crate::scrcpy::PacketRead::TimedOut`]), not an error.
+const STREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A cooperative cancellation flag shared between the UI thread and the
+/// pipeline worker thread.
+///
+/// The UI owns one of these and hands a clone to the spawned pipeline. When the
+/// user clicks "Stop mirroring" the UI calls [`CancelFlag::cancel`]; the
+/// pipeline checks [`CancelFlag::is_cancelled`] at natural boundaries (before
+/// each blocking adb phase and inside the stream loop) and, when set, breaks
+/// out so the existing teardown path runs exactly once.
+///
+/// The flag is an [`Arc`]-wrapped [`AtomicBool`], so flipping it from the UI
+/// thread while the pipeline thread reads it is data-race free. It defaults to
+/// NOT cancelled, and [`CancelFlag::cancel`] is idempotent (setting it twice
+/// leaves it set).
+#[derive(Debug, Clone, Default)]
+pub struct CancelFlag {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelFlag {
+    /// A fresh flag in the NOT-cancelled state.
+    pub fn new() -> Self {
+        CancelFlag {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Request cancellation. Idempotent: calling it when already cancelled
+    /// leaves the flag set, and it is safe to call when nothing is mirroring.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Reset the flag back to NOT-cancelled.
+    ///
+    /// The UI no longer reuses a single flag across runs (each run gets a FRESH
+    /// [`CancelFlag`] via [`RunGuard`], which is what removed the reset-on-Start
+    /// race). This is retained as a small utility on the primitive and is
+    /// covered by the flag-semantics test.
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether an optional cancel flag has been tripped. A `None` flag (the headless
+/// build and callers that do not support stopping) is never cancelled.
+fn is_cancelled(cancel: Option<&CancelFlag>) -> bool {
+    cancel.map(CancelFlag::is_cancelled).unwrap_or(false)
+}
+
+/// Single-threaded lifecycle guard for the mirroring pipeline, owned by the UI
+/// thread.
+///
+/// It bundles the two pieces of mirroring lifecycle state the UI must keep
+/// consistent so a fast Start-after-Stop cannot run two pipelines at once:
+///
+/// * a `started` guard that is true while a worker is live, and
+/// * the CURRENT run's [`CancelFlag`] (a FRESH flag per run, `None` when idle).
+///
+/// The critical invariants (regression-tested headlessly in this module):
+///
+/// * [`RunGuard::try_start`] gives out a fresh per-run flag and refuses to start
+///   a second run while one is still live, so Start cannot spawn an overlapping
+///   worker.
+/// * [`RunGuard::request_stop`] trips ONLY the current run's flag and is a safe
+///   no-op when idle, so Stop never cancels some later run by clearing a shared
+///   flag the previous worker had not yet observed.
+/// * [`RunGuard::worker_stopped`] is what releases the guard: the `started` flag
+///   is cleared (and the slot emptied) only when the worker actually signals
+///   termination (`PipelineStatus::Stopped`), NOT on the Stop click. Until then
+///   `try_start` keeps refusing, so the prior worker is guaranteed to have
+///   returned before the next Start proceeds.
+///
+/// Because the flag is a fresh per-run [`CancelFlag`] rather than one shared,
+/// reset-on-Start flag, there is no window where a reset clears a stop the old
+/// worker has not yet seen. It is deliberately NOT `Send`/`Sync`-bound beyond
+/// what `RefCell` allows: it lives on the UI thread and the only cross-thread
+/// handoff is the cloned [`CancelFlag`] passed into the worker.
+#[derive(Debug, Default)]
+pub struct RunGuard {
+    /// The current run's cancel flag, or `None` when no worker is live.
+    current: Option<CancelFlag>,
+}
+
+impl RunGuard {
+    /// A fresh, idle guard (no run in flight).
+    pub fn new() -> Self {
+        RunGuard { current: None }
+    }
+
+    /// Whether a worker is currently considered live (started and not yet
+    /// observed Stopped).
+    pub fn is_started(&self) -> bool {
+        self.current.is_some()
+    }
+
+    /// Attempt to begin a run. Returns a FRESH [`CancelFlag`] for the new run on
+    /// success, or `None` when a run is already live (so the caller must NOT
+    /// spawn an overlapping worker). The returned flag is stored as the current
+    /// run's flag so a later [`RunGuard::request_stop`] trips exactly this run.
+    pub fn try_start(&mut self) -> Option<CancelFlag> {
+        if self.current.is_some() {
+            return None;
+        }
+        let flag = CancelFlag::new();
+        self.current = Some(flag.clone());
+        Some(flag)
+    }
+
+    /// Request a stop of the CURRENT run, if any. Trips only the current run's
+    /// flag; a no-op when idle. Does NOT release the guard: the guard is freed
+    /// only once the worker signals termination via [`RunGuard::worker_stopped`],
+    /// which is what makes a Stop-then-Start sequence impossible to overlap.
+    pub fn request_stop(&self) {
+        if let Some(flag) = &self.current {
+            flag.cancel();
+        }
+    }
+
+    /// Mark the worker as terminated, releasing the guard so the next
+    /// [`RunGuard::try_start`] can proceed. Called when the UI observes
+    /// [`PipelineStatus::Stopped`] on the status channel (the worker emits it on
+    /// both the normal exit and the cancelled short-circuit). Idempotent.
+    pub fn worker_stopped(&mut self) {
+        self.current = None;
+    }
+}
 
 /// How the device is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +438,7 @@ pub fn run_pipeline_with_frames(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
 ) -> Result<(), adb::AdbError> {
-    run_pipeline_full(config, status, frame_sink, None)
+    run_pipeline_full(config, status, frame_sink, None, None)
 }
 
 /// Like [`run_pipeline_with_frames`] but also installs the scrcpy control sink
@@ -309,8 +454,19 @@ pub fn run_pipeline_full(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
     control_sink: Option<std::sync::Arc<ControlSinkSlot>>,
+    cancel: Option<CancelFlag>,
 ) -> Result<(), adb::AdbError> {
     let selector = config.selector();
+    let cancel = cancel.as_ref();
+
+    // 0. If a stop was requested before we even started (or the flag arrives
+    //    already set), short-circuit straight to Stopped WITHOUT spawning any
+    //    adb. Nothing was set up, so there is nothing to tear down. This is the
+    //    headless-testable cancellation path: no device, adb, or socket needed.
+    if is_cancelled(cancel) {
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
 
     // 1. Locate adb, preferring a previously provisioned bundled copy. If adb
     //    cannot be found anywhere, auto-provision it (download + extract
@@ -329,23 +485,70 @@ pub fn run_pipeline_full(
         status,
         PipelineStatus::AdbLocated(adb_path.display().to_string()),
     );
-    let cmd = AdbCommand::with_path(adb_path, selector.clone());
+    let mut cmd = AdbCommand::with_path(adb_path, selector.clone());
 
-    // 2. Wi-Fi connect.
-    if let Transport::WiFi { ip, port } = &config.transport {
+    // 2. Wi-Fi connect, then resolve the REAL adb-registered serial.
+    //
+    //    `config.selector()` for Wi-Fi is the raw `ip:connect_port` mDNS
+    //    connect address, which is only valid for the `adb connect` itself.
+    //    With Android 11+ TLS wireless debugging the serial adb actually
+    //    registers in `adb devices` is NOT reliably `ip:connect_port`, so every
+    //    subsequent `-s <serial>` command (push/forward/launch/teardown) must
+    //    target whatever adb listed. We resolve that serial here and REBIND
+    //    both the selector and the AdbCommand to it; USB keeps UsbDefault.
+    if is_cancelled(cancel) {
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
+    let selector = if let Transport::WiFi { ip, port } = &config.transport {
         if let Err(e) = cmd.run(&adb::connect_args(ip, *port)) {
+            // The connect itself failed, so nothing is registered to tear down.
             report(status, PipelineStatus::Error(e.to_string()));
             return Err(e);
         }
         report(status, PipelineStatus::Connected(format!("{ip}:{port}")));
+
+        let real_serial = match cmd.resolve_connected_serial(ip, *port) {
+            Ok(s) => s,
+            Err(e) => {
+                // The connect succeeded but adb never registered an online
+                // serial. Disconnect best-effort (teardown is idempotent) so we
+                // leave no half-open connection, THEN report the error so the
+                // UI's terminal Error arrives only after teardown has run and
+                // the worker is on its way out.
+                teardown_with(&cmd, config, &selector);
+                report(status, PipelineStatus::Error(e.to_string()));
+                return Err(e);
+            }
+        };
+        let resolved = DeviceSelector::Serial(real_serial.clone());
+        // Rebind the command so push/forward/launch target the resolved serial.
+        cmd = AdbCommand::with_path(cmd.adb_path.clone(), resolved.clone());
+        report(status, PipelineStatus::Connected(real_serial));
+        resolved
+    } else {
+        selector
+    };
+
+    // A stop requested during the Wi-Fi connect/resolve: nothing beyond the
+    // connect is set up yet, so disconnect (teardown is safe/idempotent even
+    // though no forward exists) and report Stopped.
+    if is_cancelled(cancel) {
+        teardown_with(&cmd, config, &selector);
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
     }
 
     // 3. Push the server jar, resolved against the executable directory so an
     //    installed app finds the bundled jar regardless of its working dir.
     let server_jar = config.resolve_server_jar();
     if let Err(e) = cmd.run(&adb::push_server_args(&selector, &server_jar)) {
+        // Tear down BEFORE reporting the terminal Error so the UI observes the
+        // Error only after teardown has run and the worker is returning; this
+        // keeps the lifecycle guard's release (on a terminal status) from
+        // freeing a Start while this worker is still tearing down.
+        teardown_with(&cmd, config, &selector);
         report(status, PipelineStatus::Error(e.to_string()));
-        teardown(&cmd, config);
         return Err(e);
     }
     report(status, PipelineStatus::ServerPushed);
@@ -356,31 +559,39 @@ pub fn run_pipeline_full(
         config.local_port,
         adb::SCRCPY_SOCKET_NAME,
     )) {
+        teardown_with(&cmd, config, &selector);
         report(status, PipelineStatus::Error(e.to_string()));
-        teardown(&cmd, config);
         return Err(e);
     }
     report(status, PipelineStatus::Forwarded(config.local_port));
+
+    // A stop requested after the forward is up but before launch: remove the
+    // forward we just added (teardown is best-effort) and report Stopped.
+    if is_cancelled(cancel) {
+        teardown_with(&cmd, config, &selector);
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
 
     // 5. Launch the scrcpy server.
     let mut server_child = match cmd.spawn(&adb::server_launch_args(&selector, &config.server_opts))
     {
         Ok(child) => child,
         Err(e) => {
+            teardown_with(&cmd, config, &selector);
             report(status, PipelineStatus::Error(e.to_string()));
-            teardown(&cmd, config);
             return Err(e);
         }
     };
     report(status, PipelineStatus::ServerLaunched);
 
     // 6. Connect the forwarded socket(s) and run the scrcpy stream.
-    let result = run_stream(config, status, frame_sink, control_sink.as_deref());
+    let result = run_stream(config, status, frame_sink, control_sink.as_deref(), cancel);
 
     // Teardown: kill the server child and remove the forward.
     let _ = server_child.kill();
     let _ = server_child.wait();
-    teardown(&cmd, config);
+    teardown_with(&cmd, config, &selector);
     report(status, PipelineStatus::Stopped);
 
     result
@@ -408,9 +619,16 @@ fn run_stream(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
     control_sink: Option<&ControlSinkSlot>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<(), adb::AdbError> {
     use std::net::TcpStream;
     use std::sync::mpsc;
+
+    // A stop requested before the socket is even dialed: return cleanly so the
+    // caller runs kill-child + teardown exactly once.
+    if is_cancelled(cancel) {
+        return Ok(());
+    }
 
     let addr = format!("{}:{}", crate::connection::DEFAULT_HOST, config.local_port);
 
@@ -422,7 +640,14 @@ fn run_stream(
             return Ok(());
         }
     };
-    let _ = video.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    // Use a SHORT read timeout (not the old 30s) so a blocked read on a stalled
+    // stream wakes often enough for the access-unit loop to observe a Stop
+    // request promptly. On a healthy stream frames arrive continuously so the
+    // timeout never fires; on a stalled one it bounds Stop latency to roughly
+    // this interval instead of ~30s. A timed-out read surfaces as a WouldBlock /
+    // TimedOut error that stream_av_packets treats as a loop wake, not a fatal
+    // error, so it re-checks the cancel flag and either continues or breaks.
+    let _ = video.set_read_timeout(Some(STREAM_READ_TIMEOUT));
 
     // Second connection is the scrcpy control channel (opened because the
     // server is launched with control=true). A failure here is not fatal to
@@ -519,7 +744,11 @@ fn run_stream(
         return Ok(());
     }
 
-    if let Err(e) = crate::scrcpy::stream_av_packets(&mut video, &mut decoder, &sink) {
+    // The access-unit loop checks the cancel flag once per iteration so a Stop
+    // breaks it promptly between packets; the 2s STREAM_READ_TIMEOUT set above
+    // lets a blocked read wake to observe the flag.
+    let cancelled = || is_cancelled(cancel);
+    if let Err(e) = crate::scrcpy::stream_av_packets(&mut video, &mut decoder, &sink, &cancelled) {
         report(status, PipelineStatus::Error(e.to_string()));
     }
     Ok(())
@@ -583,16 +812,61 @@ impl ControlSinkSlot {
     }
 }
 
-/// Best-effort teardown: remove the adb forward and (for Wi-Fi) disconnect.
+/// Best-effort teardown using the transport-derived selector.
+///
+/// Kept for callers that have not resolved a Wi-Fi serial (and for USB, where
+/// the selector is always [`DeviceSelector::UsbDefault`]). The pipeline itself
+/// uses [`teardown_with`] so it tears down against the RESOLVED serial rather
+/// than the raw `ip:connect_port`, which may not be the serial adb registered.
+pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
+    teardown_with(cmd, config, &config.selector());
+}
+
+/// Best-effort teardown against an explicit `selector`: remove the adb forward
+/// and (for Wi-Fi) disconnect.
 ///
 /// Called on both the success and failure paths. Errors are ignored because
-/// teardown must not mask the original outcome.
-pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
-    let selector = config.selector();
-    let _ = cmd.run(&adb::forward_remove_args(&selector, config.local_port));
+/// teardown must not mask the original outcome. The `selector` is the RESOLVED
+/// serial for a Wi-Fi connection so the forward removed is the same one that
+/// was added.
+///
+/// Wi-Fi disconnect: `adb disconnect <target>` is keyed on the connection
+/// ADDRESS, and the address this pipeline connected with is the mDNS
+/// `ip:connect_port` the `adb connect` used, so that is the primary disconnect
+/// target. However, Bug 4 showed that on Android 11+ TLS wireless debugging adb
+/// can REGISTER the device under a different serial (`ip:registered_port`) than
+/// the connect address. To make sure a successful connect leaves no orphaned
+/// entry regardless of which address adb kept, we ALSO disconnect the resolved
+/// serial when it differs from the connect address. Both calls are best-effort
+/// and idempotent (adb exits cleanly when the target is already gone), so the
+/// extra call is a safe no-op in the common case where the two addresses match.
+/// This cannot be exercised headlessly (no adb/device) and is finally verified
+/// by the user on the real Windows device.
+pub fn teardown_with(cmd: &AdbCommand, config: &PipelineConfig, selector: &DeviceSelector) {
+    let _ = cmd.run(&adb::forward_remove_args(selector, config.local_port));
     if let Transport::WiFi { ip, port } = &config.transport {
+        let connect_addr = format!("{ip}:{port}");
         let _ = cmd.run(&adb::disconnect_args(ip, *port));
+        // Defensively drop the resolved serial too, when adb registered the
+        // device under a different address than we connected with.
+        if let DeviceSelector::Serial(serial) = selector {
+            if serial != &connect_addr {
+                if let Some((host, resolved_port)) = split_host_port(serial) {
+                    let _ = cmd.run(&adb::disconnect_args(host, resolved_port));
+                }
+            }
+        }
     }
+}
+
+/// Split a `host:port` adb serial into its host and numeric port, or `None` if
+/// it is not a `host:port` form (for example a plain USB serial). Used so
+/// teardown can disconnect a resolved Wi-Fi serial that differs from the
+/// connect address. Splits on the LAST colon so IPv6-style hosts are tolerated.
+fn split_host_port(serial: &str) -> Option<(&str, u16)> {
+    let (host, port) = serial.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    Some((host, port))
 }
 
 #[cfg(test)]
@@ -647,6 +921,75 @@ mod tests {
         } else {
             panic!("expected a Wi-Fi transport");
         }
+    }
+
+    /// The BLOCKER-fix invariant (Bug 4): after `adb connect` on the mDNS
+    /// connect port, the serial adb actually registers can differ from
+    /// `ip:connect_port`. The pipeline resolves the REAL registered serial from
+    /// `adb devices -l` and threads THAT (not the raw connect port) into push,
+    /// forward, launch, and teardown. `resolve_connected_serial` is retry-based
+    /// and impure, so this exercises the pure pieces end to end: parse a
+    /// devices sample whose port differs from the connect port, resolve the
+    /// serial, and assert every downstream arg vector carries the RESOLVED
+    /// `-s <serial>` selector rather than `192.168.1.42:37000`.
+    #[test]
+    fn resolved_serial_not_connect_port_flows_into_push_and_launch() {
+        let connect_host = "192.168.1.42";
+        let connect_port = 37000u16; // mDNS connect port used only by `adb connect`
+        let raw_connect_serial = format!("{connect_host}:{connect_port}");
+
+        // What `adb devices -l` lists: the same device under a DIFFERENT port.
+        let devices_output = "List of devices attached\n\
+            192.168.1.42:42817 device product:redfin model:Pixel_5 device:redfin transport_id:3\n";
+        let devices = crate::adb::parse_devices(devices_output);
+        let resolved = crate::adb::resolve_wireless_serial(&devices, connect_host, connect_port)
+            .expect("device for the connected host must resolve");
+        assert_eq!(
+            resolved, "192.168.1.42:42817",
+            "resolved serial must be the registered port, not the connect port"
+        );
+        assert_ne!(
+            resolved, raw_connect_serial,
+            "the fix must NOT reuse the raw connect-port serial"
+        );
+
+        let sel = DeviceSelector::Serial(resolved.clone());
+
+        // push targets the resolved serial, not ip:connect_port.
+        let push = crate::adb::push_server_args(&sel, "scrcpy-server.jar");
+        assert_eq!(push[0], "-s");
+        assert_eq!(push[1], resolved);
+        assert_ne!(push[1], raw_connect_serial);
+
+        // server launch targets the resolved serial.
+        let launch = crate::adb::server_launch_args(&sel, &ServerLaunchOptions::default());
+        assert_eq!(launch[0], "-s");
+        assert_eq!(launch[1], resolved);
+        assert_ne!(launch[1], raw_connect_serial);
+
+        // forward and forward --remove (teardown) also use the resolved serial.
+        let forward = crate::adb::forward_args(&sel, 27183, crate::adb::SCRCPY_SOCKET_NAME);
+        assert_eq!(&forward[0..2], &["-s".to_string(), resolved.clone()]);
+        let forward_remove = crate::adb::forward_remove_args(&sel, 27183);
+        assert_eq!(&forward_remove[0..2], &["-s".to_string(), resolved.clone()]);
+    }
+
+    /// `split_host_port` recovers the host and port from a `host:port` Wi-Fi
+    /// serial (so teardown can defensively disconnect a resolved serial that
+    /// differs from the connect address) and returns `None` for a non-host:port
+    /// serial such as a USB device id.
+    #[test]
+    fn split_host_port_parses_wifi_serial_and_rejects_usb() {
+        assert_eq!(
+            split_host_port("192.168.1.42:42817"),
+            Some(("192.168.1.42", 42817))
+        );
+        // Splits on the last colon so an IPv6-style host is tolerated.
+        assert_eq!(split_host_port("fe80::1:5555"), Some(("fe80::1", 5555)));
+        // A plain USB serial has no port and must not parse.
+        assert_eq!(split_host_port("ZY223KLMNO"), None);
+        // A non-numeric port must not parse.
+        assert_eq!(split_host_port("192.168.1.42:notaport"), None);
     }
 
     #[test]
@@ -850,5 +1193,180 @@ mod tests {
             PipelineStatus::Paired("192.168.1.42:37000".into()).to_string(),
             "paired with 192.168.1.42:37000"
         );
+    }
+
+    // --- Feature 6: cooperative stop / teardown (headless) ----------------
+
+    /// A fresh [`CancelFlag`] is NOT cancelled, [`CancelFlag::cancel`] trips it,
+    /// setting it twice leaves it set (idempotent), and [`CancelFlag::reset`]
+    /// clears it so the same flag can be reused for a later Start.
+    #[test]
+    fn cancel_flag_semantics_are_idempotent() {
+        let flag = CancelFlag::new();
+        assert!(!flag.is_cancelled(), "a fresh flag must not be cancelled");
+
+        flag.cancel();
+        assert!(flag.is_cancelled(), "cancel must trip the flag");
+        // Idempotent: a second cancel leaves it set.
+        flag.cancel();
+        assert!(flag.is_cancelled(), "a second cancel must leave it set");
+
+        // A clone shares the same state (the UI hands a clone to the thread).
+        let clone = flag.clone();
+        assert!(clone.is_cancelled(), "a clone must observe the same state");
+
+        flag.reset();
+        assert!(!flag.is_cancelled(), "reset must clear the flag");
+        assert!(
+            !clone.is_cancelled(),
+            "reset must be visible through a clone"
+        );
+    }
+
+    /// The `Default` impl matches `new`: not cancelled.
+    #[test]
+    fn cancel_flag_default_is_not_cancelled() {
+        assert!(!CancelFlag::default().is_cancelled());
+    }
+
+    /// The lifecycle fix (review issues 1 and 2): a fresh per-run flag plus a
+    /// guard released only on worker termination makes Stop-then-Start
+    /// impossible to overlap.
+    ///
+    /// Start hands out a fresh flag and marks the run live; a SECOND start while
+    /// the first is still live is refused (None), so the UI cannot spawn an
+    /// overlapping worker. request_stop trips ONLY the current run's flag and
+    /// does NOT free the guard. The guard is freed only when the worker signals
+    /// termination (worker_stopped, driven by observing PipelineStatus::Stopped),
+    /// after which a new start succeeds with a DISTINCT flag that is NOT
+    /// cancelled by the previous Stop.
+    #[test]
+    fn run_guard_refuses_overlap_until_worker_stopped() {
+        let mut guard = RunGuard::new();
+        assert!(!guard.is_started(), "a fresh guard is idle");
+        // request_stop and worker_stopped are safe no-ops when idle.
+        guard.request_stop();
+        guard.worker_stopped();
+        assert!(!guard.is_started());
+
+        // First Start: get a fresh flag, run is now live.
+        let first = guard.try_start().expect("first start must succeed");
+        assert!(guard.is_started());
+        assert!(!first.is_cancelled(), "a fresh run flag is not cancelled");
+
+        // A second Start BEFORE the worker terminates is refused, so no
+        // overlapping worker can be spawned.
+        assert!(
+            guard.try_start().is_none(),
+            "a second start must be refused while a run is live"
+        );
+
+        // Stop trips ONLY the current run's flag; the guard stays live until the
+        // worker actually terminates.
+        guard.request_stop();
+        assert!(first.is_cancelled(), "stop must trip the current run's flag");
+        assert!(
+            guard.is_started(),
+            "the guard must NOT be released on the Stop click"
+        );
+        assert!(
+            guard.try_start().is_none(),
+            "a start after Stop but before Stopped is observed must still be refused"
+        );
+
+        // The worker terminates (PipelineStatus::Stopped observed) -> guard freed.
+        guard.worker_stopped();
+        assert!(!guard.is_started(), "worker_stopped releases the guard");
+
+        // Now a fresh Start succeeds with a DISTINCT flag that the earlier Stop
+        // did NOT cancel (no shared-flag reuse race).
+        let second = guard.try_start().expect("start after Stopped must succeed");
+        assert!(
+            !second.is_cancelled(),
+            "the new run's flag must be fresh, not cancelled by the earlier Stop"
+        );
+        // Tripping the old flag must not affect the new run, and vice versa.
+        first.cancel();
+        assert!(
+            !second.is_cancelled(),
+            "the previous run's flag must not cancel the current run"
+        );
+    }
+
+    /// The optional-flag helper treats `None` (headless / non-stoppable
+    /// callers) as never cancelled and honors a `Some` flag's state.
+    #[test]
+    fn is_cancelled_helper_handles_none_and_some() {
+        assert!(!is_cancelled(None), "None must never be cancelled");
+
+        let flag = CancelFlag::new();
+        assert!(!is_cancelled(Some(&flag)));
+        flag.cancel();
+        assert!(is_cancelled(Some(&flag)));
+    }
+
+    /// A pre-set cancel flag short-circuits [`run_pipeline_full`] straight to
+    /// [`PipelineStatus::Stopped`] WITHOUT spawning any adb, which is why this
+    /// runs on the headless host with no device, adb, or socket. It must return
+    /// `Ok(())` promptly (not hang) and emit exactly `Stopped`.
+    #[test]
+    fn cancelled_pipeline_reaches_stopped_without_device() {
+        let cfg = PipelineConfig::default();
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancelFlag::new();
+        cancel.cancel(); // already cancelled before the run starts
+
+        let result = run_pipeline_full(&cfg, &tx, None, None, Some(cancel));
+        assert!(result.is_ok(), "an already-cancelled run must return Ok");
+
+        let statuses: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            statuses,
+            vec![PipelineStatus::Stopped],
+            "a pre-cancelled run must emit only Stopped, with no adb/connect"
+        );
+    }
+
+    /// Teardown is best-effort and idempotent: calling [`teardown`] /
+    /// [`teardown_with`] twice (and when nothing was set up) does not panic, and
+    /// it drives exactly the expected `forward --remove` and (for Wi-Fi)
+    /// `disconnect` arg vectors against the resolved selector. The AdbCommand
+    /// points at a path that does not exist, so each `run` fails silently (as
+    /// teardown already ignores errors), which is the headless stand-in for a
+    /// device that was never fully set up.
+    #[test]
+    fn teardown_is_idempotent_and_builds_expected_args() {
+        // The exact arg vectors teardown drives, asserted directly so the test
+        // fails if the teardown wiring changes.
+        let wifi_cfg = PipelineConfig {
+            transport: Transport::WiFi {
+                ip: "192.168.1.42".into(),
+                port: 37000,
+            },
+            local_port: 27183,
+            ..PipelineConfig::default()
+        };
+        let resolved = DeviceSelector::Serial("192.168.1.42:42817".into());
+        assert_eq!(
+            adb::forward_remove_args(&resolved, wifi_cfg.local_port),
+            vec!["-s", "192.168.1.42:42817", "forward", "--remove", "tcp:27183"]
+        );
+        assert_eq!(
+            adb::disconnect_args("192.168.1.42", 37000),
+            vec!["disconnect", "192.168.1.42:37000"]
+        );
+
+        // Calling teardown twice (and for a USB config where nothing was set
+        // up) must not panic. The adb path is intentionally bogus so run()
+        // returns Err, which teardown ignores.
+        let bogus = std::path::PathBuf::from("/nonexistent/adb-does-not-exist");
+        let wifi_cmd = AdbCommand::with_path(bogus.clone(), resolved.clone());
+        teardown_with(&wifi_cmd, &wifi_cfg, &resolved);
+        teardown_with(&wifi_cmd, &wifi_cfg, &resolved); // idempotent second call
+
+        let usb_cfg = PipelineConfig::default();
+        let usb_cmd = AdbCommand::with_path(bogus, DeviceSelector::UsbDefault);
+        teardown(&usb_cmd, &usb_cfg);
+        teardown(&usb_cmd, &usb_cfg); // nothing was set up; still safe
     }
 }

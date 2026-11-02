@@ -16,6 +16,10 @@ export struct DiscoveredDevice {
     label: string,
     // The stable identifier passed back to connect-device / pair-and-connect.
     id: string,
+    // Whether this device has already been paired with this PC. Remembered
+    // devices show a one-click Connect; never-paired devices show Pair instead
+    // (a bare connect to an unpaired device always fails).
+    remembered: bool,
 }
 
 // Non-intrusive update notification dialog. Shown only when an update is
@@ -240,7 +244,7 @@ component WirelessDialog inherits Rectangle {
         }
 
         Text {
-            text: "On the phone, enable Settings > Developer options > Wireless debugging and keep it on the same Wi-Fi as this PC. The FIRST time, open 'Pair device with pairing code' and type the 6-digit code below. After that, FluxBridge reconnects automatically.";
+            text: "On the phone, enable Settings > Developer options > Wireless debugging and keep it on the same Wi-Fi as this PC, then click Scan. First time with a device: open 'Pair device with pairing code' on the phone FIRST and leave that screen open (the 6-digit code shows only while it is open; FluxBridge cannot trigger it remotely). Type the code below and click Pair. After the first pairing, the device shows a Connect button and FluxBridge reconnects to it automatically.";
             wrap: word-wrap;
             color: #9aa0a6;
             font-size: 12px;
@@ -286,11 +290,23 @@ component WirelessDialog inherits Rectangle {
                             overflow: elide;
                             horizontal-stretch: 1;
                         }
-                        Button {
+                        // Remembered devices get a one-click Connect. Never-paired
+                        // devices get Pair instead, which pairs that specific row
+                        // with the typed 6-digit code (a bare connect to an
+                        // unpaired device always fails).
+                        if device.remembered: Button {
                             text: "Connect";
                             enabled: !root.busy;
                             clicked => {
                                 root.connect-device(device.id);
+                            }
+                        }
+                        if !device.remembered: Button {
+                            text: "Pair";
+                            primary: true;
+                            enabled: !root.busy;
+                            clicked => {
+                                root.pair-and-connect(root.pairing-code, device.id);
                             }
                         }
                     }
@@ -298,16 +314,18 @@ component WirelessDialog inherits Rectangle {
             }
         }
         if root.devices.length == 0: Text {
-            text: "No devices yet. Enable Wireless debugging on the phone, then Scan.";
+            text: "No devices yet. On the phone turn on Wireless debugging and join this PC's Wi-Fi, then click Scan. For a first pairing also open Pair device with pairing code and leave it open.";
             color: #5f6368;
             font-size: 12px;
             wrap: word-wrap;
         }
 
-        // One-time pairing row: 6-digit code + Pair & connect. Pairs the FIRST
-        // discovered pairing endpoint (or the single discovered device).
+        // One-time pairing row: enter the 6-digit code, then click Pair on the
+        // device's row above (or use the button here when a pairing endpoint is
+        // the only thing advertised). The code shows on the phone only while the
+        // Pair device with pairing code screen is open.
         Text {
-            text: "First time? Enter the 6-digit pairing code from the phone:";
+            text: "First time with a device? Open 'Pair device with pairing code' on the phone, type its 6-digit code here, then click Pair on that device above:";
             color: #e8eaed;
             font-size: 13px;
             wrap: word-wrap;
@@ -321,7 +339,7 @@ component WirelessDialog inherits Rectangle {
                 width: 120px;
             }
             Button {
-                text: "Pair & connect";
+                text: "Pair";
                 primary: true;
                 enabled: !root.busy;
                 clicked => {
@@ -411,6 +429,10 @@ export component MainWindow inherits Window {
     callback start();
     callback quit();
     callback check-for-updates();
+    // End the current mirroring session and return to the Start menu WITHOUT
+    // quitting the app. Wired in src/ui.rs: it trips a cooperative cancel flag
+    // the pipeline observes to tear down cleanly, then re-shows the menu.
+    callback stop-mirroring();
     // A pointer tap on the video surface, reported as normalized coordinates
     // (0.0..=1.0) plus a pressed flag. ui.rs scales to device pixels and sends
     // it through the scrcpy control sink. This is the input-injection path.
@@ -438,10 +460,23 @@ export component MainWindow inherits Window {
                 horizontal-alignment: center;
                 wrap: word-wrap;
             }
-            Button {
-                text: "Help";
-                clicked => {
-                    root.help-toggle();
+            HorizontalBox {
+                spacing: 8px;
+                horizontal-stretch: 0;
+                // Stop / Disconnect: shown ONLY while mirroring is active (the
+                // Start menu is hidden). Ends the current session and returns to
+                // the menu without quitting the app, so the user can reconnect.
+                if !root.menu-visible: Button {
+                    text: "Stop mirroring";
+                    clicked => {
+                        root.stop-mirroring();
+                    }
+                }
+                Button {
+                    text: "Help";
+                    clicked => {
+                        root.help-toggle();
+                    }
                 }
             }
         }

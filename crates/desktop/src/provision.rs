@@ -566,4 +566,69 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
+
+    /// Bug 2 (same-session, no restart): after [`ensure_adb`] provisions adb,
+    /// a SUBSEQUENT [`crate::adb::locate_or_provisioned`] call in the SAME
+    /// process must immediately resolve the freshly provisioned adb, so the
+    /// in-flight action (Scan/Connect/Start) can continue without the user
+    /// closing and reopening the app.
+    ///
+    /// The whole sequence runs against an env-isolated temp data dir (HOME /
+    /// XDG_DATA_HOME / LOCALAPPDATA point at it) with ANDROID_HOME /
+    /// ANDROID_SDK_ROOT / PATH stripped so the normal adb search cannot
+    /// accidentally succeed. It asserts the three states the bug is about:
+    /// (a) BEFORE provisioning, resolution fails NotFound; (b) `ensure_adb`
+    /// with the fake transport creates the provisioned adb; (c) AFTER, a fresh
+    /// resolution in the same process returns that provisioned path (proving no
+    /// cached NotFound and no restart are needed to pick it up).
+    #[test]
+    fn locate_or_provisioned_resolves_fresh_adb_same_session_after_ensure() {
+        crate::test_env::with_env_lock(|| {
+            let root = std::env::temp_dir().join(format!(
+                "fluxbridge-samesession-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+
+            // Point the per-user data dir at our temp root on every platform and
+            // strip the adb search inputs so locate_adb cannot succeed.
+            std::env::set_var("HOME", &root);
+            std::env::set_var("XDG_DATA_HOME", &root);
+            std::env::set_var("LOCALAPPDATA", &root);
+            std::env::remove_var("ANDROID_HOME");
+            std::env::remove_var("ANDROID_SDK_ROOT");
+            std::env::set_var("PATH", "/nonexistent-path-xyz");
+
+            let data_dir = data_dir().expect("data dir resolves from the temp env");
+
+            // (a) Before provisioning: no adb anywhere, so resolution fails.
+            assert!(
+                matches!(
+                    crate::adb::locate_or_provisioned(&data_dir),
+                    Err(crate::adb::AdbError::NotFound { .. })
+                ),
+                "adb must be absent before provisioning"
+            );
+
+            // (b) Provision adb with the offline fake transport + synthetic zip.
+            let transport = FakeZipTransport::new(synthetic_platform_tools_zip());
+            let provisioned =
+                ensure_adb(&data_dir, &transport, &mut |_| {}).expect("provisioning succeeds");
+            assert_eq!(provisioned, provisioned_adb_path(&data_dir));
+            assert!(provisioned.is_file(), "the provisioned adb file exists");
+
+            // (c) Same process, no restart: a FRESH resolution now returns the
+            // just-provisioned path. This is the exact behavior Bug 2 was
+            // missing (the user previously had to reopen the app).
+            let resolved = crate::adb::locate_or_provisioned(&data_dir)
+                .expect("the freshly provisioned adb resolves in the same session");
+            assert_eq!(
+                resolved, provisioned,
+                "the resolved adb must be the one ensure_adb just installed"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
 }

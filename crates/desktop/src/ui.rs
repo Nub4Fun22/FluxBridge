@@ -18,7 +18,7 @@ slint::include_modules!();
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
 
 use slint::ComponentHandle;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -75,18 +75,58 @@ CONNECT OVER USB (recommended, most reliable)
 
 CONNECT OVER WI-FI (automatic discovery + one-time pairing)
 FluxBridge uses Android 11+ Wireless debugging, so you do NOT type an IP by hand.
-1. On the phone, enable Settings > Developer options > Wireless debugging and
-   keep the phone on the SAME Wi-Fi network as this PC.
-2. In FluxBridge, open 'Connect wirelessly' from the Start menu and click Scan.
+This is a one-time setup. After the first pairing FluxBridge reconnects on its
+own. Take it step by step.
+
+Step 1. Enable Developer Options on the phone (one time).
+   Open Settings > About phone and tap 'Build number' 7 times. The phone
+   confirms that you are now a developer. The exact place varies by brand: on
+   many Samsung phones 'Build number' lives under Settings > About phone >
+   Software information. If you cannot find it, search your Settings app for
+   'Build number'.
+
+Step 2. Turn on Wireless debugging (one time).
+   Open Settings > System > Developer options > Wireless debugging and switch
+   it On. Keep the phone on the SAME Wi-Fi network as this PC.
+
+Step 3. Open the pairing screen on the phone FIRST, then pair.
+   On the phone, inside Wireless debugging, tap 'Pair device with pairing code'.
+   The phone shows a 6-digit code and an IP address with a port. Leave that
+   screen open: the code and the pairing endpoint only exist while this screen
+   is on, and the PC cannot pop it up for you remotely.
+   In FluxBridge, open 'Connect wirelessly' from the Start menu and click Scan.
    FluxBridge discovers the phone automatically over mDNS (it drives
-   'adb mdns services' for you).
-3. FIRST TIME ONLY: on the phone tap 'Pair device with pairing code'. The phone
-   shows a 6-digit code. Type that code into FluxBridge and click 'Pair &
-   connect'. FluxBridge runs 'adb pair' and then 'adb connect' automatically.
-4. FluxBridge remembers the device, so the NEXT time you launch it reconnects on
-   its own with no code and no clicks.
-Honest note: the one-time 6-digit code is shown only on the phone, so that very
-first pairing cannot be fully automatic. Everything after it is.
+   'adb mdns services' for you). For a phone you have never paired before, use
+   'Pair & connect' and type the 6-digit code from the phone, NOT plain
+   Connect. FluxBridge runs 'adb pair' and then 'adb connect' for you.
+
+Step 4. After the first pairing, just launch FluxBridge.
+   FluxBridge remembers the device, so the NEXT time you start it, it
+   auto-reconnects with no code and no clicks. You only repeat Step 3 if you
+   forget the device or reset Wireless debugging.
+
+To end a session: click 'Stop mirroring' to disconnect and return to the Start
+menu without quitting the app, then Start (or 'Connect wirelessly') again to
+reconnect quickly.
+
+Honest note: the one-time 6-digit code is shown only on the phone, and only
+while the 'Pair device with pairing code' screen is open, so that very first
+pairing cannot be fully automatic. Everything after it is.
+
+WHY DOES FLUXBRIDGE NEED DEVELOPER OPTIONS / WIRELESS DEBUGGING?
+Short answer: full mirroring plus control over Wi-Fi requires adb, and adb over
+Wi-Fi requires Developer Options > Wireless debugging. There is no way around
+this for an app of this kind. scrcpy and Vysor need exactly the same thing.
+Android has no public API that lets a regular app both capture the screen and
+inject touches and keys without adb.
+The alternatives are weaker and out of scope for FluxBridge:
+- A view-only phone-side app using MediaProjection could show the screen, but it
+  cannot inject input (so no control from the PC) and it pops up a capture
+  permission prompt every single session.
+- Vendor tools such as Samsung DeX or Windows Phone Link work without adb, but
+  they are brand-specific and do not give the same full-control mirroring.
+So FluxBridge asks for a one-time Developer Options setup, and auto-reconnects
+afterward, rather than shipping a weaker view-only experience.
 
 ABOUT BLUETOOTH
 Bluetooth is NOT used for video. Live phone mirroring is H.264 at tens of
@@ -181,7 +221,20 @@ pub fn build_main_window(
     let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>();
     // Channel the pipeline reports status/errors on.
     let (status_tx, status_rx) = mpsc::channel::<crate::pipeline::PipelineStatus>();
-    attach_pipeline_status(&window, status_rx);
+
+    // The mirroring lifecycle guard, owned on the UI thread. It holds the
+    // CURRENT run's cancel flag (a FRESH flag per run) and the started state.
+    // Start takes a fresh flag from it (refused while a run is live), Stop trips
+    // the current run's flag, and the guard is released only when the worker
+    // signals termination (PipelineStatus::Stopped observed below). Sharing one
+    // guard across the Start closure, the Stop closure, and the status timer is
+    // what makes a fast Start-after-Stop impossible to overlap.
+    let run_guard = Rc::new(RefCell::new(crate::pipeline::RunGuard::new()));
+
+    // The status timer drains PipelineStatus and, on Stopped, releases the guard
+    // so a subsequent Start can spawn a fresh pipeline only AFTER the prior
+    // worker has actually returned.
+    attach_pipeline_status(&window, status_rx, Rc::clone(&run_guard));
     attach_frame_sink(&window, frame_rx);
 
     // Shared slot the pipeline installs the scrcpy control sink into once the
@@ -193,20 +246,26 @@ pub fn build_main_window(
     // Start the adb-driven pipeline on a worker thread. Shared by the Start
     // button (USB / auto-reconnect transport from the config) and by the
     // wireless panel once it has paired/connected a device (an explicit Wi-Fi
-    // transport is passed in). A guard prevents spawning duplicate pipelines.
-    let started = Rc::new(Cell::new(false));
+    // transport is passed in). The RunGuard refuses to spawn a second pipeline
+    // while one is still live (and until the prior worker has signalled
+    // termination), so duplicate/overlapping runs cannot happen.
     let pipeline_cfg = Arc::new(pipeline_cfg);
     let start_slot = Arc::clone(&control_slot);
     let start_status_tx = status_tx.clone();
     let start_frame_tx = frame_tx.clone();
     let start_pipeline: Rc<dyn Fn(Option<crate::pipeline::Transport>)> = {
-        let started = Rc::clone(&started);
+        let run_guard = Rc::clone(&run_guard);
         let pipeline_cfg = Arc::clone(&pipeline_cfg);
         Rc::new(move |transport: Option<crate::pipeline::Transport>| {
-            if started.replace(true) {
-                // Already running; nothing more to spawn.
-                return;
-            }
+            // Take a FRESH per-run cancel flag. `None` means a run is still
+            // live (not yet observed Stopped), so we must NOT spawn an
+            // overlapping worker. Because each run gets its own flag, there is
+            // no shared flag to "reset" and therefore no window in which a reset
+            // could clear a stop the previous worker had not yet observed.
+            let cancel = match run_guard.borrow_mut().try_start() {
+                Some(flag) => flag,
+                None => return,
+            };
             // Clone the base config and override the transport when the wireless
             // panel supplies a freshly discovered Wi-Fi endpoint.
             let mut cfg = (*pipeline_cfg).clone();
@@ -218,8 +277,13 @@ pub fn build_main_window(
             let frames = start_frame_tx.clone();
             let slot = Arc::clone(&start_slot);
             std::thread::spawn(move || {
-                let _ =
-                    crate::pipeline::run_pipeline_full(&cfg, &status, Some(frames), Some(slot));
+                let _ = crate::pipeline::run_pipeline_full(
+                    &cfg,
+                    &status,
+                    Some(frames),
+                    Some(slot),
+                    Some(cancel),
+                );
             });
         })
     };
@@ -232,6 +296,35 @@ pub fn build_main_window(
         w.set_menu_visible(false);
         w.set_connection_status("Starting...".into());
         start_for_button(None);
+    });
+
+    // Stop mirroring: end the current session and return to the Start menu
+    // WITHOUT quitting the app (distinct from on_quit). Tripping ONLY the
+    // current run's cancel flag makes the pipeline thread break its loop and run
+    // the existing teardown (forward --remove, kill the server child, Wi-Fi
+    // disconnect) exactly once; the thread self-exits when run_pipeline_full
+    // returns and emits PipelineStatus::Stopped, which is what releases the
+    // RunGuard (in the status timer below). We deliberately do NOT clear the
+    // guard here: releasing it on worker termination rather than on this click
+    // is what guarantees a prior run has fully stopped before the next Start can
+    // spawn, so two pipelines can never contend for the same forward port and
+    // device. request_stop is idempotent and a safe no-op when not mirroring.
+    // The visible UI is reset to the menu state immediately so the user gets
+    // instant feedback; remembered devices are left untouched for quick
+    // reconnect.
+    let weak = window.as_weak();
+    let stop_guard = Rc::clone(&run_guard);
+    window.on_stop_mirroring(move || {
+        stop_guard.borrow().request_stop();
+        if let Some(w) = weak.upgrade() {
+            w.set_menu_visible(true);
+            // Clear the video surface so the placeholder shows again. An empty
+            // image has width 0, which the slint fallback keys off.
+            w.set_frame(slint::Image::default());
+            w.set_connection_status("Ready".into());
+            w.set_pipeline_status("Idle".into());
+            w.set_pipeline_status_is_error(false);
+        }
     });
 
     // --- Wireless discovery / pairing panel wiring ------------------------
@@ -433,6 +526,7 @@ fn wire_wireless_panel(
                             .map(|d| DiscoveredDevice {
                                 label: d.label.into(),
                                 id: d.id.into(),
+                                remembered: d.remembered,
                             })
                             .collect();
                         w.set_wireless_devices(
@@ -466,6 +560,7 @@ fn wire_wireless_panel(
 pub fn attach_pipeline_status(
     window: &MainWindow,
     status_events: Receiver<crate::pipeline::PipelineStatus>,
+    run_guard: Rc<RefCell<crate::pipeline::RunGuard>>,
 ) {
     use crate::pipeline::PipelineStatus;
 
@@ -478,6 +573,16 @@ pub fn attach_pipeline_status(
         move || {
             let Some(w) = weak.upgrade() else { return };
             for status in events.try_iter() {
+                // The worker reached a TERMINAL state and has returned: Stopped
+                // (normal exit or the cancelled short-circuit) or Error (a
+                // failure path that returns Err without a further Stopped).
+                // Release the RunGuard HERE, not on the Stop click, so a new
+                // Start cannot spawn until the prior worker has fully torn down.
+                // Both are terminal for run_pipeline_full, so either one means
+                // the thread is on its way out.
+                if matches!(status, PipelineStatus::Stopped | PipelineStatus::Error(_)) {
+                    run_guard.borrow_mut().worker_stopped();
+                }
                 let is_error = matches!(status, PipelineStatus::Error(_));
                 w.set_pipeline_status(status.to_string().into());
                 w.set_pipeline_status_is_error(is_error);
@@ -692,5 +797,34 @@ fn apply_event(
                 w.set_app_status_is_error(update_event_is_error(&event));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // HELP_TEXT is compiled only under the `gui` feature (it lives in this
+    // module, which is gated on `gui`), so this test runs when the crate is
+    // tested with `--features gui`. It guards the beginner-friendly wireless
+    // guide and the honest Developer Options rationale against silent drift.
+    use super::HELP_TEXT;
+
+    #[test]
+    fn help_text_covers_the_wireless_guide_and_rationale() {
+        // Enabling Developer Options and Wireless debugging.
+        assert!(HELP_TEXT.contains("Build number"));
+        assert!(HELP_TEXT.contains("Wireless debugging"));
+        // Pairing via the 6-digit code, open the pairing screen first.
+        assert!(HELP_TEXT.contains("Pair device with pairing code"));
+        assert!(HELP_TEXT.contains("6-digit"));
+        // Never-paired devices use Pair & connect, not plain Connect.
+        assert!(HELP_TEXT.contains("Pair & connect"));
+        // Auto-reconnect after the first pairing.
+        assert!(HELP_TEXT.contains("auto-reconnect"));
+        // The honest "Why Developer Options" rationale section.
+        assert!(HELP_TEXT.contains("WHY DOES FLUXBRIDGE NEED DEVELOPER OPTIONS"));
+        // The Stop mirroring control from FEAT-004 is mentioned.
+        assert!(HELP_TEXT.contains("Stop mirroring"));
+        // No em dashes anywhere in the help copy.
+        assert!(!HELP_TEXT.contains('\u{2014}'));
     }
 }
