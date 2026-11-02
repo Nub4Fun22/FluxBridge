@@ -365,6 +365,17 @@ const DUMMY_BYTE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// instead of blocking forever.
 const DUMMY_BYTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Short bounded grace wait before snapshotting the server output on the
+/// failure path. The server's stdout/stderr are drained by detached reader
+/// threads (see [`spawn_server_output_reader`]); when the stream fails to start
+/// the snapshot is taken synchronously, which can race those threads so the
+/// server's final lines (the version mismatch or stack trace that explains the
+/// failure) have not been parsed and pushed yet. A brief wait gives the readers
+/// a chance to flush before the snapshot. It is well under a second and is only
+/// paid on the error path, never on the happy streaming path; a silent server
+/// still ends up with an empty buffer and the explicit "(no output captured)".
+const SERVER_OUTPUT_GRACE_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// A bounded, thread-safe ring buffer of the scrcpy server's most recent output
 /// lines, so a server-side startup failure (a version mismatch, an
 /// `app_process` error, an unsupported option, a Java stack trace) can be
@@ -454,6 +465,21 @@ fn spawn_server_output_reader(child: &mut std::process::Child, buffer: &ServerOu
         let buf = buffer.clone();
         std::thread::spawn(move || buf.drain_from(stderr));
     }
+}
+
+/// Snapshot the captured server output for the error path after a short bounded
+/// grace wait (see [`SERVER_OUTPUT_GRACE_WAIT`]).
+///
+/// The reader threads drain the server's pipes independently, so at the instant
+/// the stream-start retry gives up the server's final lines may not be parsed
+/// and pushed yet. The brief wait lets the readers flush so a server that
+/// printed its failure reason is reliably reflected in the error, rather than
+/// losing those lines to a thread-scheduling race. The wait is bounded and
+/// never blocks indefinitely: a silent server simply still yields an empty
+/// snapshot and the explicit "(no output captured)".
+fn snapshot_server_output_after_grace(server_output: &ServerOutputBuffer) -> Option<String> {
+    std::thread::sleep(SERVER_OUTPUT_GRACE_WAIT);
+    server_output.snapshot(SERVER_OUTPUT_LINES)
 }
 
 /// Build the actionable error message shown when the forward-mode stream cannot
@@ -828,7 +854,7 @@ fn run_stream(
                     status,
                     PipelineStatus::Error(stream_start_error(
                         &format!("video socket {addr}: {e}"),
-                        server_output.snapshot(SERVER_OUTPUT_LINES),
+                        snapshot_server_output_after_grace(server_output),
                     )),
                 );
                 return Ok(());
@@ -948,7 +974,7 @@ fn run_stream(
                 status,
                 PipelineStatus::Error(stream_start_error(
                     &format!("dummy byte: {e}"),
-                    server_output.snapshot(SERVER_OUTPUT_LINES),
+                    snapshot_server_output_after_grace(server_output),
                 )),
             );
             return Ok(());
@@ -964,7 +990,7 @@ fn run_stream(
                 status,
                 PipelineStatus::Error(stream_start_error(
                     &format!("video header: {e}"),
-                    server_output.snapshot(SERVER_OUTPUT_LINES),
+                    snapshot_server_output_after_grace(server_output),
                 )),
             );
             return Ok(());
@@ -1481,6 +1507,44 @@ mod tests {
         let message = stream_start_error("dummy byte: timeout", empty.snapshot(SERVER_OUTPUT_LINES));
         assert!(message.contains("(no output captured)"), "{message}");
         assert!(message.contains("Wireless debugging"));
+        assert!(!message.contains('\u{2014}'));
+    }
+
+    /// The grace-drain snapshot reliably reflects server output that was pushed
+    /// around the time of the failure, so the diagnosable-failure guarantee is
+    /// not best-effort. A line captured before the snapshot must appear in the
+    /// surfaced error. This exercises the buffer/snapshot/error-message
+    /// contract directly rather than relying on real reader-thread timing.
+    #[test]
+    fn grace_snapshot_includes_server_output_pushed_before_failure() {
+        let server_output = ServerOutputBuffer::new();
+        // The server printed its reason and closed the socket; the line is in
+        // the buffer by the time the error path snapshots it.
+        server_output.push_line("[server] ERROR: app_process failed to start");
+
+        let snap = snapshot_server_output_after_grace(&server_output);
+        let message = stream_start_error("dummy byte: unexpected EOF", snap);
+
+        assert!(
+            message.contains("app_process failed to start"),
+            "grace snapshot must surface the captured server line, got: {message}"
+        );
+        assert!(message.contains("Wireless debugging"));
+        assert!(!message.contains("(no output captured)"));
+        assert!(!message.contains('\u{2014}'));
+    }
+
+    /// The grace drain must not invent output: a server that was genuinely
+    /// silent still yields an empty snapshot and the explicit
+    /// "(no output captured)", so the bounded wait never masks real silence.
+    #[test]
+    fn grace_snapshot_stays_empty_for_a_silent_server() {
+        let server_output = ServerOutputBuffer::new();
+        let snap = snapshot_server_output_after_grace(&server_output);
+        assert!(snap.is_none(), "a silent server must snapshot to None");
+
+        let message = stream_start_error("dummy byte: unexpected EOF", snap);
+        assert!(message.contains("(no output captured)"), "{message}");
         assert!(!message.contains('\u{2014}'));
     }
 
