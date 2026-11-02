@@ -1,16 +1,24 @@
-//! Stream decode loop.
+//! Decoders and the FluxBridge-native (`0xFB`) decode loop.
 //!
-//! Pulls [`PacketType::VideoFrame`] packets from the connection channel, feeds
-//! their payloads to a [`VideoDecoder`] trait object, and pushes the resulting
-//! [`DecodedFrame`] buffers onto a frame sink (an `mpsc` channel the UI thread
-//! drains to update the video surface).
+//! This module owns the [`VideoDecoder`] implementations ([`StubDecoder`] and,
+//! behind the `decode` feature, [`FfmpegDecoder`]) plus [`run_decode_loop`],
+//! which pulls [`PacketType::VideoFrame`] packets off a FluxBridge
+//! [`crate::connection::Connection`] channel and feeds them to a decoder.
+//!
+//! IMPORTANT: [`run_decode_loop`] and the `0xFB` [`crate::connection::Connection`]
+//! it consumes from are the FluxBridge-NATIVE path, retained for a future
+//! FluxBridge-native capture server. They are NOT on the shipped v1 scrcpy
+//! mirroring path. The v1 path drives the scrcpy wire format directly (see
+//! [`crate::scrcpy::stream_av_packets`], called from [`crate::pipeline`]), which
+//! feeds these same decoders without going through `run_decode_loop`. The
+//! decoder trait object is the shared seam between both paths.
 //!
 //! The decoder is a trait object so the real backend (FFmpeg with DXVA2 /
 //! D3D11VA on Windows, VA-API / VDPAU on Linux) can be dropped in without
-//! touching this loop. This module ships [`StubDecoder`], a pure-Rust software
-//! decoder that fabricates a frame from the encoded bytes. It exists purely so
-//! the scaffold runs end-to-end on a host with no FFmpeg; it is NOT a real
-//! codec and must be replaced before shipping.
+//! touching the loop. [`StubDecoder`] is a pure-Rust placeholder that echoes the
+//! encoded bytes so the default and `gui` builds run with no FFmpeg linkage; it
+//! is NOT a real codec. The real pixels come from [`FfmpegDecoder`] under the
+//! `decode` feature.
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -66,13 +74,158 @@ impl VideoDecoder for StubDecoder {
     }
 }
 
-/// Run the decode loop until the packet channel closes.
+/// Real FFmpeg-backed H.264 decoder, compiled only under the `decode` feature.
+///
+/// This is the shipping decode path. It is gated behind `decode` (OFF by
+/// default) because it links FFmpeg/libav via the `ffmpeg-next` crate, which
+/// needs the libav development libraries present at build/link time. Those are
+/// NOT installed on the headless Linux CI host, so the default and `gui` builds
+/// use [`StubDecoder`] instead and never pull FFmpeg in.
+///
+/// # Windows build/link requirements (honest notes)
+///
+/// `ffmpeg-next` binds the system FFmpeg. On Windows the practical path is to
+/// install the FFmpeg "dev" (shared + headers) build, typically via `vcpkg`
+/// (`vcpkg install ffmpeg`) and point `FFMPEG_DIR` / `PKG_CONFIG_PATH` at it so
+/// the `ffmpeg-sys-next` build script can find `avcodec`, `avformat`,
+/// `avutil`, and `swscale`. The CI release workflow provisions these before a
+/// `--features decode` build. Hardware acceleration on Windows is DXVA2 or
+/// D3D11VA; this software path is the portable baseline and a hwaccel device
+/// can be attached to the same `decoder::Video` later without changing the
+/// [`VideoDecoder`] trait boundary. On Linux the equivalent dev packages are
+/// `libavcodec-dev` / `libavutil-dev` / `libswscale-dev` and the hwaccel is
+/// VA-API / VDPAU.
+///
+/// The decoder feeds each scrcpy access unit (an Annex-B H.264 NAL run) as a
+/// `Packet` to the libav H.264 decoder and converts the first decoded frame to
+/// a tightly packed RGBA buffer with `swscale`, which is directly usable as a
+/// `slint::Image` (`SharedPixelBuffer<Rgba8Pixel>`).
+#[cfg(feature = "decode")]
+pub struct FfmpegDecoder {
+    decoder: Option<ffmpeg_next::decoder::Video>,
+    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "decode")]
+impl FfmpegDecoder {
+    /// Create an unconfigured FFmpeg decoder, initializing libav once.
+    pub fn new() -> CoreResult<Self> {
+        ffmpeg_next::init()
+            .map_err(|e| fluxbridge_core::CoreError::Other(format!("ffmpeg init: {e}")))?;
+        Ok(FfmpegDecoder {
+            decoder: None,
+            scaler: None,
+            width: 0,
+            height: 0,
+        })
+    }
+}
+
+#[cfg(feature = "decode")]
+impl VideoDecoder for FfmpegDecoder {
+    fn configure(&mut self, config: &VideoConfig) -> CoreResult<()> {
+        use ffmpeg_next::codec::{context::Context, Id};
+        let codec = ffmpeg_next::decoder::find(Id::H264)
+            .ok_or_else(|| fluxbridge_core::CoreError::Other("no H264 decoder".into()))?;
+        let ctx = Context::new_with_codec(codec);
+        let decoder = ctx
+            .decoder()
+            .video()
+            .map_err(|e| fluxbridge_core::CoreError::Other(format!("open h264 decoder: {e}")))?;
+        self.width = config.width;
+        self.height = config.height;
+        self.decoder = Some(decoder);
+        self.scaler = None;
+        Ok(())
+    }
+
+    fn decode(&mut self, encoded: &[u8]) -> CoreResult<DecodedFrame> {
+        use ffmpeg_next::format::Pixel;
+        use ffmpeg_next::software::scaling::{Context as Scaler, Flags};
+        use ffmpeg_next::util::frame::Video as VideoFrame;
+
+        let decoder = self
+            .decoder
+            .as_mut()
+            .ok_or_else(|| fluxbridge_core::CoreError::Other("decoder not configured".into()))?;
+
+        let packet = ffmpeg_next::Packet::copy(encoded);
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| fluxbridge_core::CoreError::Other(format!("send_packet: {e}")))?;
+
+        let mut decoded = VideoFrame::empty();
+        if decoder.receive_frame(&mut decoded).is_err() {
+            // No frame ready yet (needs more input); return an empty frame the
+            // loop can ignore.
+            return Ok(DecodedFrame {
+                width: self.width,
+                height: self.height,
+                pixel_format: "rgba".to_string(),
+                data: Vec::new(),
+            });
+        }
+
+        let w = decoded.width();
+        let h = decoded.height();
+        let scaler = self.scaler.get_or_insert_with(|| {
+            Scaler::get(
+                decoded.format(),
+                w,
+                h,
+                Pixel::RGBA,
+                w,
+                h,
+                Flags::BILINEAR,
+            )
+            .expect("create swscale context")
+        });
+        let mut rgba = VideoFrame::empty();
+        scaler
+            .run(&decoded, &mut rgba)
+            .map_err(|e| fluxbridge_core::CoreError::Other(format!("swscale: {e}")))?;
+
+        // Copy tightly packed RGBA (strip any row stride padding).
+        let stride = rgba.stride(0);
+        let row_bytes = (w * 4) as usize;
+        let src = rgba.data(0);
+        let mut data = Vec::with_capacity(row_bytes * h as usize);
+        for row in 0..h as usize {
+            let start = row * stride;
+            data.extend_from_slice(&src[start..start + row_bytes]);
+        }
+        Ok(DecodedFrame {
+            width: w,
+            height: h,
+            pixel_format: "rgba".to_string(),
+            data,
+        })
+    }
+
+    fn flush(&mut self) -> CoreResult<()> {
+        if let Some(decoder) = self.decoder.as_mut() {
+            let _ = decoder.flush();
+        }
+        Ok(())
+    }
+}
+
+/// Run the FluxBridge-native (`0xFB`) decode loop until the packet channel
+/// closes.
+///
+/// This consumes [`PacketType::VideoFrame`] / [`PacketType::VideoConfig`]
+/// packets off a FluxBridge [`crate::connection::Connection`]. It is NOT used on
+/// the shipped v1 scrcpy mirroring path (which uses
+/// [`crate::scrcpy::stream_av_packets`]); it is kept for a future
+/// FluxBridge-native capture server that speaks the `0xFB` protocol.
 ///
 /// For every packet received:
-/// * [`PacketType::VideoConfig`] payloads (re)configure the decoder. In this
-///   scaffold the config bytes are not parsed; a fixed [`VideoConfig`] is used
-///   so the stub has sane dimensions. The real loop will decode the config
-///   payload defined in `docs/PROTOCOL.md`.
+/// * [`PacketType::VideoConfig`] payloads (re)configure the decoder. The config
+///   bytes are not parsed yet; a fixed [`VideoConfig`] is used so the stub has
+///   sane dimensions. A native server will carry the config payload defined in
+///   `docs/PROTOCOL.md`.
 /// * [`PacketType::VideoFrame`] payloads are decoded and the resulting
 ///   [`DecodedFrame`] is pushed to `frame_sink`.
 /// * All other packet types are ignored here (handled elsewhere).

@@ -9,79 +9,102 @@
 // Pull in the Slint-generated types (MainWindow, UpdateDialog, ...).
 slint::include_modules!();
 
+/// The application icon, embedded at build time as a 256x256 RGBA PNG.
+///
+/// Generated from `assets/icon.svg` by the icon xtask (see README.md) and
+/// committed alongside `assets/icon.ico`. Embedding the bytes means the running
+/// window can set its icon without depending on a file being present next to
+/// the installed executable.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
+
 use slint::ComponentHandle;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
-use fluxbridge_core::ReleaseInfo;
+use fluxbridge_core::{DecodedFrame, ReleaseInfo};
 use fluxbridge_updater::{GithubUpdater, UreqTransport};
 
+use fluxbridge_core::protocol::TouchEvent;
+use fluxbridge_core::InputSink;
+
 use crate::connection::ConnectionConfig;
-use crate::updater_ui::{run_update, UpdateEvent};
+use crate::pipeline::{ControlSinkSlot, PipelineConfig};
+use crate::updater_ui::{
+    run_update, spawn_update_check, update_event_is_error, update_event_status, UpdateEvent,
+};
 
 /// The in-app help / "how to connect" guide shown by the Help panel.
 ///
-/// Kept accurate to what FluxBridge actually supports: Android via ADB (USB and
-/// Wi-Fi) with an mDNS auto-pairing path planned, and iOS within Apple's
-/// ecosystem limits (AirPlay/mDNS mirroring, libimobiledevice/WebDriverAgent).
+/// Kept HONEST about what the code actually does today: Android mirroring over
+/// USB and Wi-Fi via adb, driving the scrcpy server pushed to the device.
+/// Bluetooth is deliberately NOT used for video (its bandwidth is far too low
+/// for live H.264) and iOS is a documented future strategy, not yet functional.
 /// See `docs/IOS_STRATEGY.md`, `android-server/README.md` and the root README.
 const HELP_TEXT: &str = "\
-FluxBridge mirrors and controls your phone from this PC. Pick your platform below.
+FluxBridge mirrors and controls your Android phone from this PC over USB or Wi-Fi.
 
-WHAT YOU NEED (all platforms)
+HOW IT CONNECTS (the short version)
+FluxBridge talks to your phone with adb (Android Debug Bridge). It pushes the
+scrcpy server to the phone, sets up a local port forward, launches the server,
+then streams H.264 video back over that forwarded socket and decodes it here.
+
+WHAT YOU NEED
 - This FluxBridge desktop client (you are running it).
-- The phone and PC reachable over USB or the same local Wi-Fi network.
-- The FluxBridge device-side server running on the phone (see Android below).
-- Default connection target: 127.0.0.1:27183. You can override it by passing a
-  host:port argument when launching the client.
-
-ANDROID (recommended, full control)
-Requirements:
-- Android phone with Developer Options and USB debugging enabled.
-  Enable them in Settings > About phone > tap Build number 7 times, then
+- adb installed on the PC (part of the Android platform tools). FluxBridge looks
+  for adb on your PATH and in the usual Android SDK locations.
+- An Android phone with Developer Options and USB debugging enabled:
+  Settings > About phone > tap Build number 7 times, then
   Settings > System > Developer options > USB debugging.
-- ADB (Android Debug Bridge) installed on the PC (part of the Android platform
-  tools). The first USB connection prompts you on the phone to Allow / authorize
-  this computer for USB debugging; accept it.
-- The FluxBridge Android capture server pushed to the device (it runs via
-  app_process under the shell UID, so there is no app to install).
+- Default connection target: 127.0.0.1:27183 (the forwarded port). You can
+  override it by passing a host:port argument when launching the client.
 
-Connect over USB:
-1. Plug the phone into the PC with a USB cable and authorize the prompt.
-2. Push the server and forward the port, then launch it:
-     adb push fluxbridge-server.jar /data/local/tmp/
-     adb forward tcp:27183 tcp:27183
-     adb shell CLASSPATH=/data/local/tmp/fluxbridge-server.jar \\
-         app_process / com.fluxbridge.server.Server 27183
-3. Start FluxBridge; it dials 127.0.0.1:27183, which ADB tunnels to the phone.
+CONNECT OVER USB (recommended, most reliable)
+1. Plug the phone into the PC with a USB cable.
+2. On the phone, accept the 'Allow USB debugging' prompt for this computer.
+3. Click Start. FluxBridge runs, roughly:
+     adb push scrcpy-server.jar /data/local/tmp/
+     adb forward tcp:27183 localabstract:scrcpy
+     adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar \\
+         app_process / com.genymobile.scrcpy.Server
+   then dials 127.0.0.1:27183, which adb tunnels to the phone.
 
-Connect over Wi-Fi:
-1. With the phone on USB once, switch ADB to TCP/IP and find the phone's IP:
+CONNECT OVER WI-FI
+1. Connect the phone over USB once and switch adb to TCP/IP, then find its IP:
      adb tcpip 5555
      adb shell ip route        (note the wlan0 address, e.g. 192.168.1.42)
-2. Unplug, connect over the network, then push + forward + launch as above:
-     adb connect 192.168.1.42:5555
-     adb -s 192.168.1.42:5555 forward tcp:27183 tcp:27183
+2. Unplug. Launch FluxBridge with the phone's address, for example:
+     fluxbridge-desktop 192.168.1.42
+   FluxBridge runs 'adb connect 192.168.1.42:5555' and then the same
+   push / forward / launch flow as USB.
 Note: wireless mDNS auto-pairing (no manual adb connect) is planned; until then
-use the manual steps above.
+use the steps above.
 
-iOS / iPhone (mirroring-first, Apple ecosystem limits apply)
-Apple does not expose an ADB-style input-injection or free screen-capture API,
-so iOS support is more limited than Android:
-- Mirroring: FluxBridge acts as an AirPlay receiver discovered over mDNS /
-  Bonjour. Open Control Center on the iPhone, tap Screen Mirroring, and pick
-  FluxBridge; iOS streams the whole screen (full-screen only, no per-app view).
-  A wired libimobiledevice path over USB is a lower-latency fallback.
-- Control: synthesizing taps/swipes requires WebDriverAgent, a signed developer
-  app deployed over USB via libimobiledevice. Without it, iOS is mirroring only;
-  FluxBridge surfaces that state clearly.
+ABOUT BLUETOOTH
+Bluetooth is NOT used for video. Live phone mirroring is H.264 at tens of
+megabits per second, and Bluetooth bandwidth is far too low to carry that, so a
+Bluetooth video path is not possible. At most, Bluetooth could serve as a future
+low-bandwidth side-channel (for example clipboard or notifications), never the
+screen stream. Use USB or Wi-Fi for mirroring.
+
+ABOUT iOS / iPhone
+iOS is a documented future strategy and is NOT functional yet. Apple does not
+expose an adb-style capture or input-injection API, so the planned approach
+(AirPlay receiver for mirroring, libimobiledevice / WebDriverAgent for control)
+is described in docs/IOS_STRATEGY.md but not implemented in this build.
+
+UPDATES
+FluxBridge checks for updates automatically at startup. You can also re-check at
+any time from the Start menu using 'Check for updates'. If a newer release is
+available you will be offered it; otherwise you will see a short confirmation
+that you are on the latest version.
 
 TROUBLESHOOTING
-- 'not started' / cannot connect: confirm the device-side server is running and
-  that adb forward tcp:27183 is active (USB) or the phone's IP is reachable (Wi-Fi).
-- Android unauthorized: re-check the Allow USB debugging prompt on the phone.
+- 'adb not found': install the Android platform tools and make sure adb is on
+  your PATH (or under ANDROID_HOME / ANDROID_SDK_ROOT).
+- 'no device' / cannot connect: confirm the phone is plugged in and authorized
+  (USB) or reachable at its IP (Wi-Fi), and that USB debugging is enabled.
 - Wrong address: pass the correct host:port when launching the client.";
 
 /// Build the main window and wire the updater dialog.
@@ -93,14 +116,25 @@ pub fn build_main_window(
     config: &ConnectionConfig,
     updater: GithubUpdater<UreqTransport>,
     update_events: Receiver<UpdateEvent>,
+    pipeline_cfg: PipelineConfig,
+    current_version: String,
 ) -> Result<MainWindow, slint::PlatformError> {
     let window = MainWindow::new()?;
-    window.set_connection_status(format!("Connecting to {}", config.address()).into());
+    window.set_connection_status(format!("Target {}", config.address()).into());
+
+    // Set the live window icon from the embedded PNG. Done on a one-shot timer
+    // so the winit window exists (the accessor only yields a window once the
+    // event loop is active). Degrades to a logged no-op if anything is missing
+    // or the winit backend is not in use; it never panics.
+    install_window_icon(&window);
 
     // Seed the in-app help panel with the connection guide. It stays hidden
     // until the user clicks the Help button.
     window.set_help_text(HELP_TEXT.into());
     window.set_help_visible(false);
+    // Show the landing menu on launch; mirroring starts only when the user
+    // clicks Start.
+    window.set_menu_visible(true);
 
     // Help button toggles the panel; the panel's Close button hides it.
     let weak = window.as_weak();
@@ -124,6 +158,106 @@ pub fn build_main_window(
     let current_release: Rc<RefCell<Option<ReleaseInfo>>> = Rc::new(RefCell::new(None));
     // Arc so the download worker thread can share the updater with the UI.
     let updater = Arc::new(updater);
+
+    // --- Start-menu wiring -------------------------------------------------
+
+    // Quit: cleanly stop the Slint event loop.
+    window.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+
+    // Channel the decoded frames flow through once Start kicks off the pipeline.
+    let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>();
+    // Channel the pipeline reports status/errors on.
+    let (status_tx, status_rx) = mpsc::channel::<crate::pipeline::PipelineStatus>();
+    attach_pipeline_status(&window, status_rx);
+    attach_frame_sink(&window, frame_rx);
+
+    // Shared slot the pipeline installs the scrcpy control sink into once the
+    // control socket is up and the video header is parsed. The video-pointer
+    // handler below takes the sink and forwards taps to the device, making
+    // input injection a real, exercised path (not dead code).
+    let control_slot = Arc::new(ControlSinkSlot::new());
+
+    // Start: hide the menu and begin the adb-driven pipeline on a worker thread.
+    // Only started once (a guard prevents spawning duplicate pipelines).
+    let started = Rc::new(Cell::new(false));
+    let weak = window.as_weak();
+    let pipeline_cfg = Arc::new(pipeline_cfg);
+    let start_slot = Arc::clone(&control_slot);
+    window.on_start(move || {
+        let Some(w) = weak.upgrade() else { return };
+        if started.replace(true) {
+            // Already running; just make sure the menu is dismissed.
+            w.set_menu_visible(false);
+            return;
+        }
+        w.set_menu_visible(false);
+        w.set_connection_status("Starting...".into());
+        let cfg = Arc::clone(&pipeline_cfg);
+        let status = status_tx.clone();
+        let frames = frame_tx.clone();
+        let slot = Arc::clone(&start_slot);
+        std::thread::spawn(move || {
+            let _ = crate::pipeline::run_pipeline_full(&cfg, &status, Some(frames), Some(slot));
+        });
+    });
+
+    // Video pointer input: scale normalized surface coordinates to device
+    // pixels and forward a tap (down then up) through the scrcpy control sink.
+    // The sink is taken from the slot once (after the pipeline installs it) and
+    // held here; until then taps are dropped. This is the live PC -> device
+    // input-injection path over the scrcpy control socket.
+    let held_sink: Rc<RefCell<Option<Box<dyn InputSink>>>> = Rc::new(RefCell::new(None));
+    let pointer_slot = Arc::clone(&control_slot);
+    window.on_video_pointer(move |nx, ny, _pressed| {
+        // Lazily take the sink the pipeline installed.
+        if held_sink.borrow().is_none() {
+            if let Some(sink) = pointer_slot.take() {
+                *held_sink.borrow_mut() = Some(sink);
+            }
+        }
+        let (dev_w, dev_h) = pointer_slot.resolution();
+        if dev_w == 0 || dev_h == 0 {
+            return;
+        }
+        let x = (nx.clamp(0.0, 1.0) * dev_w as f32).round() as u16;
+        let y = (ny.clamp(0.0, 1.0) * dev_h as f32).round() as u16;
+        if let Some(sink) = held_sink.borrow_mut().as_mut() {
+            // A tap is a touch-down immediately followed by a touch-up at the
+            // same point.
+            let _ = sink.send_touch(TouchEvent {
+                pointer_id: 0,
+                x,
+                y,
+                action: 0, // down
+                pressure: 0xFFFF,
+            });
+            let _ = sink.send_touch(TouchEvent {
+                pointer_id: 0,
+                x,
+                y,
+                action: 1, // up
+                pressure: 0,
+            });
+        }
+    });
+
+    // Check for updates: run the existing updater on a worker thread and feed
+    // the result into the same UpdateEvent pump the startup check uses.
+    let manual_updater = Arc::clone(&updater);
+    let manual_tx = worker_tx.clone();
+    let manual_version = current_version;
+    let weak = window.as_weak();
+    window.on_check_for_updates(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_app_status("Checking for updates...".into());
+            w.set_app_status_is_error(false);
+        }
+        // spawn_update_check needs an owned updater; clone the inner value.
+        let updater = (*manual_updater).clone();
+        spawn_update_check(updater, manual_version.clone(), manual_tx.clone());
+    });
 
     // Dismiss ("Mai tarziu / Refuza").
     let weak = window.as_weak();
@@ -160,6 +294,162 @@ pub fn build_main_window(
     Ok(window)
 }
 
+/// Drain [`PipelineStatus`](crate::pipeline::PipelineStatus) updates from the
+/// adb-driven pipeline onto the window's status line.
+///
+/// This is how the GUI build learns about connection progress and failures
+/// WITHOUT depending on a console: the pipeline thread sends statuses on an
+/// `mpsc` channel and a UI-thread timer copies the latest one into the
+/// `pipeline-status` property (styling errors red). A windowed Windows build
+/// has no stdout, so this channel is the only path for "adb not found" or
+/// "no device" to reach the user.
+pub fn attach_pipeline_status(
+    window: &MainWindow,
+    status_events: Receiver<crate::pipeline::PipelineStatus>,
+) {
+    use crate::pipeline::PipelineStatus;
+
+    let timer = Rc::new(slint::Timer::default());
+    let weak = window.as_weak();
+    let events = Rc::new(status_events);
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            for status in events.try_iter() {
+                let is_error = matches!(status, PipelineStatus::Error(_));
+                w.set_pipeline_status(status.to_string().into());
+                w.set_pipeline_status_is_error(is_error);
+            }
+        },
+    );
+    std::mem::forget(timer);
+}
+
+/// Drain [`DecodedFrame`]s off the decode loop and draw them into the window's
+/// `frame` image property.
+///
+/// A UI-thread timer takes the most recent frame each tick and converts it into
+/// a [`slint::Image`] via a [`slint::SharedPixelBuffer`]. Only RGBA frames of
+/// the expected size are drawn; anything else (the `StubDecoder`'s `"stub"`
+/// frames under a gui-without-decode build, or an empty/short buffer) is
+/// ignored so the fallback placeholder stays visible and nothing panics. The
+/// real pixels come from the FFmpeg `decode` build, which emits tightly packed
+/// `"rgba"`.
+pub fn attach_frame_sink(window: &MainWindow, frames: Receiver<DecodedFrame>) {
+    let timer = Rc::new(slint::Timer::default());
+    let weak = window.as_weak();
+    let frames = Rc::new(frames);
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(16),
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            // Only keep the latest frame per tick to avoid falling behind.
+            if let Some(frame) = frames.try_iter().last() {
+                if let Some(image) = decoded_frame_to_image(&frame) {
+                    w.set_frame(image);
+                }
+            }
+        },
+    );
+    std::mem::forget(timer);
+}
+
+/// Convert a [`DecodedFrame`] into a [`slint::Image`], or `None` when the frame
+/// is not a drawable RGBA buffer.
+///
+/// Guards against the `StubDecoder` frames (`pixel_format == "stub"`, whose
+/// bytes are encoded input, not pixels) and against any buffer whose length
+/// does not match `width * height * 4`, so a non-RGBA or truncated frame cannot
+/// panic `SharedPixelBuffer`.
+fn decoded_frame_to_image(frame: &DecodedFrame) -> Option<slint::Image> {
+    if frame.pixel_format != "rgba" {
+        return None;
+    }
+    let (w, h) = (frame.width, frame.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let expected = (w as usize) * (h as usize) * 4;
+    if frame.data.len() != expected {
+        return None;
+    }
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+    buffer
+        .make_mut_bytes()
+        .copy_from_slice(&frame.data);
+    Some(slint::Image::from_rgba8(buffer))
+}
+
+/// Set the running window's icon from the embedded [`WINDOW_ICON_PNG`].
+///
+/// The winit window only exists once the event loop is active, so this arms a
+/// single-shot timer that, on its first tick, decodes the PNG and calls winit's
+/// `set_window_icon`. Every failure mode (decode error, no winit window, wrong
+/// backend) is logged and ignored so a missing or unusable asset never panics
+/// or crashes the GUI.
+fn install_window_icon(window: &MainWindow) {
+    use slint::winit_030::{winit::window::Icon, WinitWindowAccessor};
+
+    let (rgba, w, h) = match decode_icon_rgba(WINDOW_ICON_PNG) {
+        Some(parts) => parts,
+        None => {
+            eprintln!("fluxbridge: window icon asset could not be decoded; skipping");
+            return;
+        }
+    };
+
+    let timer = Rc::new(slint::Timer::default());
+    let weak = window.as_weak();
+    let timer_for_cb = Rc::clone(&timer);
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(50),
+        move || {
+            let Some(w_handle) = weak.upgrade() else {
+                timer_for_cb.stop();
+                return;
+            };
+            // Wait until the winit window is actually available.
+            if !w_handle.window().has_winit_window() {
+                return;
+            }
+            match Icon::from_rgba(rgba.clone(), w, h) {
+                Ok(icon) => {
+                    w_handle.window().with_winit_window(|win| {
+                        win.set_window_icon(Some(icon.clone()));
+                    });
+                }
+                Err(e) => {
+                    eprintln!("fluxbridge: could not build window icon: {e}");
+                }
+            }
+            // One-shot: stop after the first successful attempt.
+            timer_for_cb.stop();
+        },
+    );
+    // Keep the timer alive for the window's lifetime.
+    std::mem::forget(timer);
+}
+
+/// Decode the embedded PNG into a tightly packed RGBA buffer plus dimensions,
+/// or `None` on any decode error.
+fn decode_icon_rgba(png_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let decoder = png::Decoder::new(png_bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    // The embedded asset is authored as 8-bit RGBA; bail out otherwise rather
+    // than guess a conversion.
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    Some((buf, info.width, info.height))
+}
+
 /// Install a repeating timer that drains update events into the window state.
 fn pump_events(
     window: &MainWindow,
@@ -191,7 +481,7 @@ fn apply_event(
     current_release: &Rc<RefCell<Option<ReleaseInfo>>>,
     event: UpdateEvent,
 ) {
-    match event {
+    match &event {
         UpdateEvent::Available(info) => {
             w.set_update_version(info.version.clone().into());
             w.set_update_notes(info.notes.clone().into());
@@ -199,10 +489,13 @@ fn apply_event(
             w.set_update_status("".into());
             w.set_update_status_is_error(false);
             w.set_update_available(true);
-            *current_release.borrow_mut() = Some(info);
+            // Clear any transient "checking..." line now that the dialog shows.
+            w.set_app_status("".into());
+            w.set_app_status_is_error(false);
+            *current_release.borrow_mut() = Some(info.clone());
         }
         UpdateEvent::Progress(pct) => {
-            w.set_update_progress(pct as f32);
+            w.set_update_progress(*pct as f32);
         }
         UpdateEvent::Applied(_) => {
             // The installer was launched; the running binary must exit so it can
@@ -220,12 +513,24 @@ fn apply_event(
             );
             w.set_update_status_is_error(false);
         }
-        UpdateEvent::UpToDate => {}
+        UpdateEvent::UpToDate => {
+            // Previously silent. Surface a visible confirmation on the general
+            // status line so the manual "Check for updates" has feedback.
+            if let Some(text) = update_event_status(&event) {
+                w.set_app_status(text.into());
+                w.set_app_status_is_error(false);
+            }
+        }
         UpdateEvent::Failed(msg) => {
-            // Surface the failure in the dialog rather than silently hiding it.
+            // Surface the failure in the dialog if a download was underway, and
+            // always on the general status line so a manual check shows it.
             w.set_update_downloading(false);
             w.set_update_status(format!("Update failed: {msg}").into());
             w.set_update_status_is_error(true);
+            if let Some(text) = update_event_status(&event) {
+                w.set_app_status(text.into());
+                w.set_app_status_is_error(update_event_is_error(&event));
+            }
         }
     }
 }

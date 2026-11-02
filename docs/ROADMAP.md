@@ -3,6 +3,57 @@
 The project is delivered in four phases. Each phase leaves the workspace in a
 buildable, tested state and layers new capability on the decoupled core.
 
+## Delivered in this pass (Android v1 functional milestone)
+
+What is IMPLEMENTED and unit-tested headless in the current build (the headless
+default build and tests are green and the `gui` build compiles):
+
+- The adb transport layer over USB and Wi-Fi: adb discovery, the exact command
+  lines to push and launch the scrcpy server, and the local port forward
+  (`crates/desktop/src/adb.rs`), all covered by exact-argument unit tests.
+- The scrcpy wire format: the one-shot video header, the tunnel-forward dummy
+  byte, the length-prefixed H.264 access-unit framing, and the control-message
+  encoders for touch and key injection (`crates/desktop/src/scrcpy.rs`), covered
+  by synthetic-stream and exact-byte unit tests.
+- The mirroring pipeline (`crates/desktop/src/pipeline.rs`): locate adb, push
+  and launch the server, set up the forward, connect the video socket, drive the
+  scrcpy stream into the decoder, open the scrcpy control socket and build the
+  input sink from the device resolution, and tear everything down. The
+  scrcpy-driven video path and the control-sink handoff are exercised by
+  headless tests against in-memory streams and fake decoders / writers.
+- The decoder seam: a real FFmpeg H.264 decoder behind the OFF-by-default
+  `decode` feature (FFmpeg via `ffmpeg-next`), with a pure-Rust `StubDecoder`
+  keeping the default and `gui` builds link-free. Decoded RGBA frames are drawn
+  into the Slint video surface.
+- Updater discoverability: the automatic startup check is joined by a manual
+  "Check for updates" entry in the Start menu, with visible up-to-date,
+  update-available and failure feedback.
+- Application icon: an original cast/screen-share glyph authored as
+  `assets/icon.svg`, generated into a square multi-resolution `assets/icon.ico`,
+  set as the live Slint window icon, embedded into the Windows `.exe`, and wired
+  into the installer's Setup icon and shortcuts.
+- UX fixes: no stray console window on the Windows GUI release build, a
+  scrollable Help panel, and a landing Start menu (Start / Check for updates /
+  Help / Quit).
+
+What is WIRED but not yet verified end to end: live device streaming and input
+injection. The transport, scrcpy framing, control encoding, and decode seam are
+all connected into the pipeline, but a real Android phone over a real scrcpy
+server cannot be exercised on the headless Linux CI host (no device, no adb, no
+FFmpeg dev libraries, no display). End-to-end mirroring must be verified by the
+user on Windows with a phone attached: build `--features gui,decode`, bundle the
+scrcpy server jar next to the `.exe` (the installer does this), connect a device,
+and click Start. Until that pass, treat live mirroring and input as implemented
+and wired but not yet field-verified.
+
+Still deferred (tracked in the phases below, with Bluetooth video explicitly
+NOT viable): bi-directional drag-and-drop, semantic clipboard sync, the floating
+tray "pill", the virtual secondary display, the developer side panel, mDNS
+wireless auto-pairing, and iOS. Bluetooth is not a video transport: its
+bandwidth is roughly one to two orders of magnitude too low for live H.264, so
+it could only ever be a future low-bandwidth side channel (clipboard,
+notifications), never the screen stream.
+
 ## Phase 1: Windows MVP + basic Android USB stream and input
 
 - Cargo workspace, `fluxbridge-core` (wire protocol + traits) and the Slint

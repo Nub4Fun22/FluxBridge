@@ -84,6 +84,59 @@ Checks GitHub Releases on startup, offers the user "update now" or "later",
 then downloads and applies the new build. Modeled by the `Updater` trait; the
 concrete GitHub implementation lands in the `fluxbridge-updater` crate.
 
+## Android v1: the scrcpy-driven path
+
+The shipped v1 Android path does not wait for a bespoke FluxBridge capture
+server. Instead the desktop drives the upstream, MIT-licensed scrcpy server over
+adb, which is the pragmatic way to get a reliable, low-latency H.264 stream and
+input injection today. The desktop responsibilities live in feature-independent,
+unit-tested modules:
+
+- `crates/desktop/src/adb.rs` builds the adb command lines (discovery, `push`,
+  `forward`, `connect`, and `app_process` launch) as pure functions.
+- `crates/desktop/src/scrcpy.rs` parses and encodes the scrcpy wire format: the
+  one-shot video stream header, the length-prefixed H.264 access units, and the
+  scrcpy control messages for input.
+- `crates/desktop/src/pipeline.rs` orchestrates the lifecycle: locate adb, push
+  and launch the server, set up the forward, connect the video socket and drive
+  the scrcpy stream (`scrcpy::stream_av_packets`) into the decoder, open the
+  scrcpy control socket and build the input sink from the device resolution, and
+  tear everything down, reporting status over a channel (so a windowed Windows
+  build surfaces "adb not found" or "no device" without a console).
+
+This path feeds the same `VideoDecoder` trait abstraction described above: the
+scrcpy access units are fed straight to the decoder (the `decode` feature's
+FFmpeg backend, or the headless `StubDecoder`), which turns them into pixels for
+the Slint UI. The scrcpy sockets do NOT go through the FluxBridge `0xFB`
+`Connection` / `run_decode_loop` path; that path is retained only for a future
+FluxBridge-native server.
+
+### Verification status (be honest)
+
+The transport (`adb.rs`), the scrcpy framing and control encoders (`scrcpy.rs`),
+the pipeline's scrcpy-driven video path and control-sink handoff
+(`pipeline.rs`), and the decode seam (`decode_loop.rs`) are IMPLEMENTED and
+unit-tested headlessly: the stream driver runs against synthetic in-memory
+streams with a fake decoder, and the control sink is driven end to end through a
+fake writer. What has NOT been exercised here is a live device: the headless
+Linux CI host has no Android phone, no adb, no FFmpeg development libraries, and
+no display, so real end-to-end mirroring and input injection are wired but must
+be verified by the user on Windows with a phone attached (build
+`--features gui,decode`, ship the scrcpy server jar next to the `.exe`, connect a
+device, and click Start). Do not read "implemented" as "field-verified on a
+device" for the live streaming path.
+
+### Two wire formats, kept distinct
+
+- scrcpy sockets (the v1 video + control path) use scrcpy's OWN framing, encoded
+  and parsed in `scrcpy.rs`. They do NOT carry the FluxBridge `0xFB` packet
+  header.
+- The FluxBridge `0xFB` protocol in `crates/core/src/protocol.rs` (see
+  [`PROTOCOL.md`](PROTOCOL.md)) is retained for a future FluxBridge-native
+  server and for transport-agnostic input/clipboard/file framing. It is not used
+  on scrcpy sockets. The two formats never share a socket, so there is no
+  ambiguity about which parser applies.
+
 ## How the core stays decoupled
 
 - `fluxbridge-core` depends only on pure-Rust, link-free crates (`thiserror`,

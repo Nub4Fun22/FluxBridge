@@ -1,0 +1,33 @@
+# FluxBridge icon-generation xtask.
+#
+# This is a developer-only tool that rasterizes assets/icon.svg and assembles
+# the multi-resolution assets/icon.ico. It is DELIBERATELY NOT a member of the
+# root Cargo workspace (the root manifest lists it under [workspace.exclude]),
+# so the heavy rendering crates it depends on (resvg / usvg / tiny-skia / ico)
+# are NEVER pulled into `cargo build --workspace`, `cargo build --features gui`,
+# or the shipped desktop binary. Run it on demand with:
+#
+#     cargo run --manifest-path xtask/Cargo.toml -- icon
+#
+# See README.md ("Regenerating the application icon") for details.
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust SVG parsing + rendering, no native/system dependencies, so the icon
+# can be regenerated reproducibly on any host including headless CI.
+resvg = "0.42"
+usvg = "0.42"
+tiny-skia = "0.11"
+# Assembles the rasterized PNG frames into a multi-size Windows .ico.
+ico = "0.3"
+# Encodes the standalone 256 px PNG that the Slint GUI embeds for the window
+# icon. Pure-Rust, no native dependencies.
+png = "0.17"

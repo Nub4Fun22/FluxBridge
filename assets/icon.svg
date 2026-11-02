@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FluxBridge application icon.
+
+  An ORIGINAL, hand-authored rendering of the generic "cast / screen-share"
+  user-interface glyph, built entirely from plain SVG primitives (no traced,
+  embedded, downloaded or copied third-party asset). The glyph is the common
+  functional affordance for casting a screen:
+
+    * a rounded-corner rectangular "display" outline, drawn with a stroke and
+      deliberately left open along its lower-left corner; and
+    * three concentric quarter-circle Wi-Fi-style arcs radiating outward from
+      that lower-left corner (plus a small filled dot at the origin),
+
+  black (#000000) on a transparent background. The geometry is authored as
+  <path> elements with explicit move/line/arc commands so it is reproducible
+  and recognizable at small sizes (16 px and up).
+
+  The source artwork is wider than tall. The multi-resolution Windows .ico is
+  produced by the icon xtask (see xtask/ and README.md), which rasterizes this
+  SVG and centers it on a transparent SQUARE canvas with padding.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 146 78" width="146" height="78">
+  <!--
+    Display outline. A rounded rectangle drawn as an explicit path so the
+    lower-left corner can be left open for the Wi-Fi arcs to emanate from.
+    Top-left origin of the body is (34,8); width 104, height 56; corner radius
+    8. The path runs clockwise from just below the top-left corner, around the
+    top, right and bottom edges, and stops short of the bottom-left so the
+    corner near the arcs stays open.
+  -->
+  <path
+    d="M 34 46
+       L 34 16
+       A 8 8 0 0 1 42 8
+       L 130 8
+       A 8 8 0 0 1 138 16
+       L 138 58
+       A 8 8 0 0 1 130 66
+       L 62 66"
+    fill="none" stroke="#000000" stroke-width="7"
+    stroke-linecap="round" stroke-linejoin="round" />
+
+  <!--
+    Wi-Fi-style signal arcs, concentric quarter circles centered on the open
+    lower-left corner at (16,66). Each arc sweeps from straight up to straight
+    right (a 90 degree quarter turn). Radii 11, 23 and 35 give three evenly
+    spaced bands that read clearly even at small sizes.
+  -->
+  <path d="M 16 55 A 11 11 0 0 1 27 66" fill="none" stroke="#000000"
+        stroke-width="7" stroke-linecap="round" />
+  <path d="M 16 43 A 23 23 0 0 1 39 66" fill="none" stroke="#000000"
+        stroke-width="7" stroke-linecap="round" />
+  <path d="M 16 31 A 35 35 0 0 1 51 66" fill="none" stroke="#000000"
+        stroke-width="7" stroke-linecap="round" />
+
+  <!-- Origin dot: the point the signal radiates from. -->
+  <circle cx="16" cy="66" r="6" fill="#000000" />
+</svg>

@@ -1,0 +1,13 @@
+/*
+ * Windows resource script for fluxbridge-desktop.
+ *
+ * Embeds the application icon into the compiled .exe. Consumed ONLY on Windows
+ * by the `embed-resource` build dependency (see build.rs, guarded by
+ * #[cfg(windows)]); it is ignored entirely on the Linux/headless build.
+ *
+ * IDI_ICON1 is the conventional first icon id, which Windows Explorer and the
+ * shell use as the executable's display icon. The path is relative to this .rc
+ * file (crates/desktop/), so `..\..\assets\icon.ico` resolves to the repo-root
+ * assets directory.
+ */
+IDI_ICON1 ICON "..\\..\\assets\\icon.ico"

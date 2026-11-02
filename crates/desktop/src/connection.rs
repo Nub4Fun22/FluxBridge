@@ -106,13 +106,17 @@ impl Connection {
             .map_err(io_err)?;
 
         let mut conn_stream = stream.try_clone().map_err(io_err)?;
-        perform_handshake(&mut conn_stream)?;
+        // The handshake may read past the reply into the first data packet if
+        // the peer coalesces them into one TCP segment. Those leftover bytes are
+        // returned here and used to SEED the reader thread's buffer so the data
+        // packet is not dropped. See the combined-segment regression test.
+        let leftover = perform_handshake(&mut conn_stream)?;
 
         let (tx, rx) = mpsc::channel();
         let reader_stream = stream.try_clone().map_err(io_err)?;
         std::thread::Builder::new()
             .name("fluxbridge-conn-reader".into())
-            .spawn(move || reader_loop(reader_stream, tx))
+            .spawn(move || reader_loop(reader_stream, leftover, tx))
             .map_err(io_err)?;
 
         Ok(Connection {
@@ -141,34 +145,44 @@ impl Connection {
 /// Perform the client side of the handshake: send a `Handshake` packet and wait
 /// for the server's `Handshake` reply.
 ///
+/// Returns any bytes that were buffered PAST the handshake reply. When the peer
+/// writes the reply and the first data packet in the same TCP segment, a single
+/// `read` pulls both into the local buffer; the surplus is handed back to the
+/// caller so it can seed the reader thread instead of being dropped.
+///
 /// The payload is intentionally empty in this scaffold; capability negotiation
 /// (screen size, codecs, feature flags) will be added as the protocol grows.
-fn perform_handshake(stream: &mut TcpStream) -> CoreResult<()> {
+fn perform_handshake(stream: &mut TcpStream) -> CoreResult<Vec<u8>> {
     let hello = Packet::new(PacketType::Handshake, Vec::new());
     let bytes = PacketCodec::encode(&hello).map_err(CoreError::from)?;
     stream.write_all(&bytes).map_err(io_err)?;
     stream.flush().map_err(io_err)?;
 
-    let reply = read_one_packet(stream)?;
+    let (reply, leftover) = read_one_packet(stream)?;
     if reply.packet_type != PacketType::Handshake {
         return Err(CoreError::Other(format!(
             "expected Handshake reply, got {:?}",
             reply.packet_type
         )));
     }
-    Ok(())
+    Ok(leftover)
 }
 
 /// Read exactly one framed packet from a blocking stream.
 ///
 /// Grows a buffer until [`PacketCodec::decode`] reports a complete packet,
-/// handling the `Truncated` case by reading more bytes.
-fn read_one_packet(stream: &mut TcpStream) -> CoreResult<Packet> {
+/// handling the `Truncated` case by reading more bytes. Returns the decoded
+/// packet together with any bytes buffered AFTER it (the start of the next
+/// packet that shared a read with this one); callers must not discard them.
+fn read_one_packet(stream: &mut TcpStream) -> CoreResult<(Packet, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     let mut chunk = [0u8; 1024];
     loop {
         match PacketCodec::decode(&buf) {
-            Ok(DecodeResult { packet, .. }) => return Ok(packet),
+            Ok(DecodeResult { packet, consumed }) => {
+                let leftover = buf[consumed..].to_vec();
+                return Ok((packet, leftover));
+            }
             Err(fluxbridge_core::ProtocolError::Truncated { .. }) => {
                 let n = stream.read(&mut chunk).map_err(io_err)?;
                 if n == 0 {
@@ -183,8 +197,13 @@ fn read_one_packet(stream: &mut TcpStream) -> CoreResult<Packet> {
 
 /// Background reader loop: frames packets off `stream` and forwards them to
 /// `tx` until the socket closes or the receiver is dropped.
-fn reader_loop(mut stream: TcpStream, tx: Sender<Packet>) {
+///
+/// `seed` carries any bytes the handshake read past the reply (see
+/// [`perform_handshake`]); the loop starts with them already in its buffer so a
+/// data packet that shared the handshake's TCP segment is delivered, not lost.
+fn reader_loop(mut stream: TcpStream, seed: Vec<u8>, tx: Sender<Packet>) {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    buf.extend_from_slice(&seed);
     let mut chunk = [0u8; 8 * 1024];
     loop {
         // Drain all complete packets currently buffered.
@@ -314,7 +333,7 @@ mod tests {
             let (mut sock, _peer) = listener.accept().expect("accept client");
 
             // Read the client's Handshake and verify it frames correctly.
-            let hello = read_one_packet(&mut sock).expect("read client handshake");
+            let (hello, _rest) = read_one_packet(&mut sock).expect("read client handshake");
             assert_eq!(hello.packet_type, PacketType::Handshake);
 
             // Reply with our own Handshake and flush it on its own.
@@ -363,6 +382,72 @@ mod tests {
         assert_eq!(first.data, frame_payload, "frame bytes survive the round trip");
 
         // Tell the server it can close now, then let both threads wind down.
+        let _ = done_tx.send(());
+        drop(frame_rx);
+        server.join().expect("server thread");
+        decoder_thread.join().expect("decoder thread");
+    }
+
+    /// Regression test for the deferred perform_handshake trailing-bytes bug.
+    ///
+    /// The server writes the handshake reply AND the first `VideoFrame` in a
+    /// SINGLE `write` (one TCP segment), with no sleep in between. Before the
+    /// fix, `perform_handshake` decoded the reply and dropped the trailing frame
+    /// bytes left in its local buffer, so the frame never reached the decode
+    /// loop. The fix returns those leftover bytes and seeds the reader thread
+    /// with them. This test asserts the frame still arrives, specifically
+    /// WITHOUT the 150ms sleep the loopback test uses to sidestep the race.
+    #[test]
+    fn handshake_reply_and_frame_in_one_segment_still_delivers_frame() {
+        use crate::decode_loop::{run_decode_loop, StubDecoder};
+        use fluxbridge_core::DecodedFrame;
+        use std::net::TcpListener;
+        use std::sync::mpsc as std_mpsc;
+
+        let frame_payload = vec![0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let server_payload = frame_payload.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (done_tx, done_rx) = std_mpsc::channel::<()>();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept client");
+            let (hello, _rest) = read_one_packet(&mut sock).expect("read client handshake");
+            assert_eq!(hello.packet_type, PacketType::Handshake);
+
+            // Build handshake reply + first frame and write them together, so
+            // both land in one read on the client (the combined-segment case).
+            let mut combined =
+                PacketCodec::encode(&Packet::new(PacketType::Handshake, Vec::new()))
+                    .expect("encode handshake reply");
+            let frame = PacketCodec::encode(&Packet::new(PacketType::VideoFrame, server_payload))
+                .expect("encode video frame");
+            combined.extend_from_slice(&frame);
+            sock.write_all(&combined).expect("write combined segment");
+            sock.flush().expect("flush combined segment");
+
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let config = ConnectionConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            read_timeout: Some(Duration::from_secs(5)),
+        };
+        let connection = Connection::connect(&config).expect("client connects + handshakes");
+
+        let (frame_tx, frame_rx) = std_mpsc::channel::<DecodedFrame>();
+        let decoder_thread = std::thread::spawn(move || {
+            let mut decoder = StubDecoder::new();
+            let _ = run_decode_loop(connection.packets(), &mut decoder, &frame_tx);
+        });
+
+        let first = frame_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the frame that shared the handshake segment must still arrive");
+        assert_eq!(first.data, frame_payload, "coalesced frame bytes survive");
+
         let _ = done_tx.send(());
         drop(frame_rx);
         server.join().expect("server thread");

@@ -60,7 +60,55 @@ Windows product/installer name.
 - Virtual secondary display / app sandboxing on Android via `DisplayManager`.
 - Toggleable developer side panel (filtered Logcat, UI inspector, network monitor).
 - Wireless auto-pairing via mDNS and global keyboard shortcuts.
-- Intelligent in-app updater backed by the GitHub Releases API.
+- Intelligent in-app updater backed by the GitHub Releases API. FluxBridge
+  checks for updates automatically at startup, and the Start menu's "Check for
+  updates" button re-runs the check on demand (it reports when you are already
+  on the latest version, offers any newer release, or shows an error).
+
+## How the connection works (Android v1)
+
+FluxBridge v1 mirrors and controls Android over **ADB**, supporting two
+transports:
+
+- **USB:** plug the phone in, `adb forward tcp:<port> localabstract:scrcpy`
+  tunnels a local socket to the device.
+- **Wi-Fi:** `adb tcpip 5555` once over USB, then `adb connect <ip:port>` and the
+  same forward. mDNS auto-pairing is planned (Phase 2).
+
+The device-side server is the upstream, MIT-licensed **scrcpy server** jar,
+pushed to `/data/local/tmp` and launched with `app_process` (no app install).
+FluxBridge targets scrcpy server version `2.4`; the jar is bundled on the
+Windows side and is not vendored into this repo. See
+[`android-server/README.md`](android-server/README.md) for the full rationale.
+
+Two wire formats are in play, and they are kept distinct in code:
+
+- **scrcpy sockets** (the shipped v1 video + control path) use scrcpy's own
+  framing: a one-shot video header, length-prefixed H.264 access units, and
+  scrcpy control messages. Parsing/encoding lives in
+  `crates/desktop/src/scrcpy.rs`; the adb command construction lives in
+  `crates/desktop/src/adb.rs` (pure functions, unit-tested).
+- **FluxBridge `0xFB` protocol** (`crates/core/src/protocol.rs`) is retained for
+  a future FluxBridge-native server and is **not** used on scrcpy sockets.
+
+The pipeline connects the scrcpy video socket, drives the stream into the
+decoder, and opens the scrcpy control socket for input injection
+(`crates/desktop/src/pipeline.rs`). The installer ships `scrcpy-server.jar` next
+to `fluxbridge-desktop.exe`, and the app resolves it relative to the executable
+directory, so an installed build finds the jar regardless of its working
+directory.
+
+> **Verification status.** The transport, scrcpy framing, control encoding, and
+> decode seam are implemented and unit-tested headlessly (synthetic streams, a
+> fake decoder, and a fake control writer). Live end-to-end mirroring and input
+> on a real device are wired but must be verified on Windows with a phone
+> attached (`--features gui,decode`): the headless CI host has no device, adb,
+> FFmpeg dev libraries, or display, so it cannot exercise the live path.
+
+> **No Bluetooth video.** Bluetooth bandwidth is roughly one to two orders of
+> magnitude too low to carry a live H.264 screen stream, so FluxBridge does not
+> and will not mirror over Bluetooth. USB and Wi-Fi are the supported transports;
+> Bluetooth could only ever serve as a future low-bandwidth side channel.
 
 ## Repository layout
 
@@ -91,6 +139,13 @@ fluxbridge/
     README.md                Build + adb (USB/Wi-Fi) + protocol flow
     src/main/java/com/fluxbridge/server/
       Server.kt              SurfaceControl/MediaCodec/InputManager/DisplayManager stubs
+  assets/
+    icon.svg                 Hand-authored cast/screen-share glyph (source)
+    icon.ico                 Generated square multi-size Windows icon (16/32/48/256)
+    icon-256.png             Generated 256px PNG embedded as the Slint window icon
+  xtask/                     Dev-only icon generator (excluded from the workspace)
+    Cargo.toml
+    src/main.rs              `cargo run --manifest-path xtask/Cargo.toml -- icon`
   installer/
     fluxbridge.iss           Inno Setup script (fully commented)
   .github/workflows/
@@ -124,6 +179,73 @@ libraries. Build the actual windowed client with:
 ```sh
 cargo build --release --features gui --bin fluxbridge-desktop
 ```
+
+### Cargo feature matrix
+
+The desktop crate exposes a small set of opt-in features so the same source
+tree builds on a headless Linux CI host and on a Windows developer workstation
+without changing any code:
+
+| Feature   | Default | What it enables | Where it links |
+|-----------|---------|-----------------|----------------|
+| (none)    | yes     | Headless logic only: connection skeleton, decode loop driven by the pure-Rust `StubDecoder`, and updater wiring. Zero native/GUI/FFmpeg linkage. | Any host, including headless Linux CI. |
+| `gui`     | no      | Compiles and wires the Slint UI (winit backend, software renderer). Does **not** pull FFmpeg. | Links on both Linux and Windows. |
+| `decode`  | no      | Real FFmpeg H.264 decode via the `ffmpeg-next` crate, backing the real `VideoDecoder`. | Compiled and verified on **Windows only**. On headless Linux it may fail to link without the libav development packages, which is expected; leave it off there. |
+
+Features compose, so a full Windows client build is:
+
+```sh
+cargo build --release --features "gui decode" --bin fluxbridge-desktop
+```
+
+`gui` deliberately does not imply `decode`: FFmpeg cannot link on the headless
+Linux host, so keeping `decode` out of the default and `gui` feature sets lets
+`cargo build --workspace` and `cargo build --features gui` stay green there. The
+`.exe` icon resource is embedded through a Windows-only build dependency gated
+behind `[target.'cfg(windows)'.build-dependencies]`, so it never affects the
+Linux build either.
+
+### Regenerating the application icon
+
+The app icon is an original rendering of the generic "cast / screen-share"
+glyph: a rounded-corner display outline, open at the lower-left corner, with
+three concentric Wi-Fi-style quarter arcs radiating from that corner. It is
+authored by hand as vector primitives in
+[`assets/icon.svg`](assets/icon.svg) (no traced or embedded third-party asset).
+
+The committed [`assets/icon.ico`](assets/icon.ico) is a square,
+multi-resolution Windows icon (16, 32, 48 and 256 px) generated from the SVG,
+along with `assets/icon-256.png` which the GUI embeds for the live window icon.
+Generation is a developer-only [`xtask`](xtask) that is deliberately excluded
+from the Cargo workspace, so its pure-Rust rendering crates
+(`resvg` / `usvg` / `tiny-skia` / `ico` / `png`) never enter
+`cargo build --workspace`, the `gui` build, or the shipped binary. Regenerate
+both artifacts after editing the SVG with:
+
+```sh
+cargo run --manifest-path xtask/Cargo.toml -- icon
+```
+
+The icon reaches the user three ways: the Slint window sets it at startup from
+the embedded PNG (`gui` build); `crates/desktop/build.rs` embeds `icon.ico` into
+the Windows `.exe` via the Windows-only `embed-resource` build dependency (a
+no-op on Linux); and the Inno Setup installer sets it as the Setup icon and on
+the Start Menu and Desktop shortcuts.
+
+### Windows FFmpeg (decode feature) requirement
+
+The `decode` feature links the real FFmpeg H.264 decoder through `ffmpeg-next`,
+which needs the libav development libraries at build time. On Windows the
+supported path is [vcpkg](https://github.com/microsoft/vcpkg):
+
+```sh
+vcpkg install ffmpeg:x64-windows
+```
+
+then point `ffmpeg-next` at it before building, for example by exporting
+`FFMPEG_DIR` (and `PKG_CONFIG_PATH`) to the vcpkg install tree, and build with
+`--features "gui decode"`. On the headless Linux build (and in the current CI
+release job) `decode` is left off, so no libav libraries are required there.
 
 ### CARGO_HOME note for the sandbox / CI
 

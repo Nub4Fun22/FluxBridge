@@ -2,7 +2,18 @@
 
 This document specifies the binary packet format implemented in
 `crates/core/src/protocol.rs`. The protocol is transport-agnostic: the same
-framing is used over the ADB socket, TCP/Wi-Fi and any future iOS bridge.
+framing is used over any FluxBridge-native socket, TCP/Wi-Fi and any future iOS
+bridge.
+
+> **Scope: this is the FluxBridge `0xFB` protocol, not the v1 scrcpy path.** The
+> shipped Android v1 mirroring path drives the upstream scrcpy server over adb
+> and therefore speaks scrcpy's OWN wire format on those sockets: a one-shot
+> video stream header, length-prefixed H.264 access units, and scrcpy control
+> messages. That framing is handled in `crates/desktop/src/scrcpy.rs` and is
+> deliberately separate from the `0xFB` format below. The two never share a
+> socket. The `0xFB` protocol documented here is retained for a future
+> FluxBridge-native server and for transport-agnostic input, clipboard and file
+> framing; see [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the two fit together.
 
 All multi-byte integers are **big-endian** (network order). Strings are encoded
 as a big-endian `u16` byte-length followed by that many UTF-8 bytes. Because the

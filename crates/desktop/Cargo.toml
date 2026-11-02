@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 fluxbridge-core = { workspace = true }
 fluxbridge-updater = { workspace = true }
+# Big-endian read/write helpers for the scrcpy stream header, access-unit
+# framing, and control-message encoders (crates/desktop/src/scrcpy.rs). Same
+# crate the core protocol uses, so no new transitive surface.
+byteorder = { workspace = true }
 # Slint is optional and OFF by default. The headless Linux CI host has no
 # display server and no guarantee of the system GUI libraries Slint's backends
 # need, so the default build compiles all the pure-Rust logic (connection,
@@ -25,14 +29,46 @@ slint = { version = "1", optional = true, default-features = false, features = [
     "std",
     "backend-winit",
     "renderer-software",
+    # Exposes slint::winit_030::WinitWindowAccessor so the live window icon can
+    # be set via winit's set_window_icon from the embedded PNG at startup. The
+    # module is behind this (unstable) flag; the icon call degrades to a no-op
+    # (logged, never a panic) if the winit window is not available.
+    "unstable-winit-030",
 ] }
+
+# Real FFmpeg-backed H.264 decode. Optional and OFF by default: the headless
+# Linux build/CI host has no libav development libraries, so pulling this in
+# would fail to link. It is gated behind the `decode` feature (see [features])
+# and is compiled/verified on Windows, where the libav dev libraries ship with
+# the release toolchain. The pure-Rust StubDecoder keeps the default and `gui`
+# builds working with zero native linkage.
+ffmpeg-next = { version = "7", optional = true }
+
+# Decode the embedded PNG window icon for the Slint build. Pure-Rust, OFF by
+# default (only pulled with `gui`), so the headless default build gains no new
+# dependency. The .ico used for the Windows .exe/installer is a separate build
+# artifact and does not rely on this crate.
+png = { version = "0.17", optional = true }
 
 [build-dependencies]
 # Only needed when the `gui` feature compiles ui/app.slint.
 slint-build = { version = "1", optional = true }
 
+# Windows-only build dependency used to embed the .exe icon resource in a later
+# feature. It is behind `cfg(windows)` so it is never pulled on Linux and does
+# not affect the headless default or `gui` builds on this host.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "2"
+
 [features]
 default = []
 # Compile and wire the Slint UI. Requires a platform with the GUI libraries
-# Slint's winit backend needs.
-gui = ["dep:slint", "dep:slint-build"]
+# Slint's winit backend needs. Deliberately does NOT enable `decode`: FFmpeg
+# cannot link on the headless Linux host, so keeping decode out of `gui` lets
+# `cargo build --features gui` stay green here.
+gui = ["dep:slint", "dep:slint-build", "dep:png"]
+# Real FFmpeg H.264 decode path. OFF by default and NOT part of `default` or
+# `gui`. Enable on Windows (or any host with libav dev libraries) to link the
+# real VideoDecoder: `cargo build --features decode`. On headless Linux without
+# libav this will fail to link, which is expected.
+decode = ["dep:ffmpeg-next"]

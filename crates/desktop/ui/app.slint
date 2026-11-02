@@ -117,14 +117,24 @@ component HelpDialog inherits Rectangle {
             color: white;
         }
 
-        // Scrollable guide. vertical-stretch lets it grow with the panel so the
-        // step-by-step instructions scroll instead of clipping.
+        // Scrollable guide. The ScrollView gets a bounded height via
+        // vertical-stretch (it fills the leftover panel space). The inner Text
+        // is wrapped in a VerticalLayout whose min-height reflects the full
+        // wrapped body, so the scrollable content is taller than the viewport
+        // and Slint produces a working vertical scrollbar instead of clipping.
         ScrollView {
             vertical-stretch: 1;
-            Text {
-                text: root.body;
-                wrap: word-wrap;
-                color: #e8eaed;
+            VerticalLayout {
+                alignment: start;
+                body-text := Text {
+                    text: root.body;
+                    wrap: word-wrap;
+                    color: #e8eaed;
+                    // Report the full wrapped height so the enclosing layout is
+                    // at least this tall; this is what gives the ScrollView
+                    // content that exceeds its bounded viewport.
+                    min-height: self.preferred-height;
+                }
             }
         }
 
@@ -149,6 +159,13 @@ export component MainWindow inherits Window {
 
     // Connection status text, for example "Connected to 127.0.0.1:27183".
     in property <string> connection-status: "Disconnected";
+    // Live pipeline status/error from the adb-driven startup (routed from the
+    // background thread through a channel, NOT a console). Shown on the video
+    // surface so failures like "adb not found" or "no device" are visible in a
+    // windowed build that has no stdout.
+    in property <string> pipeline-status: "Idle";
+    // Whether the latest pipeline status is an error (styled red).
+    in property <bool> pipeline-status-is-error: false;
     // Whether the update dialog is visible.
     in property <bool> update-available: false;
     // Properties forwarded to the UpdateDialog.
@@ -161,6 +178,17 @@ export component MainWindow inherits Window {
     // Whether the help panel is visible, and the help body text (from ui.rs).
     in property <bool> help-visible: false;
     in property <string> help-text;
+    // Whether the landing / start menu is visible. Shown on launch; hidden once
+    // the user clicks Start to begin mirroring.
+    in property <bool> menu-visible: true;
+    // The decoded video frame to display. Empty until the first frame arrives,
+    // in which case the fallback placeholder + pipeline status are shown.
+    in property <image> frame;
+    // A general status line (for example the manual "Check for updates" result:
+    // "You are on the latest version"). Shown transiently near the top bar.
+    in property <string> app-status;
+    // Whether the general status line should be styled as an error.
+    in property <bool> app-status-is-error: false;
 
     // Re-exported dialog callbacks so main.rs / updater_ui.rs can connect them.
     callback update-accept();
@@ -168,12 +196,21 @@ export component MainWindow inherits Window {
     // Help panel callbacks: open/toggle from the Help button, close from the panel.
     callback help-toggle();
     callback help-close();
+    // Start-menu callbacks, wired in src/ui.rs.
+    callback start();
+    callback quit();
+    callback check-for-updates();
+    // A pointer tap on the video surface, reported as normalized coordinates
+    // (0.0..=1.0) plus a pressed flag. ui.rs scales to device pixels and sends
+    // it through the scrcpy control sink. This is the input-injection path.
+    callback video-pointer(float, float, bool);
 
     VerticalBox {
         padding: 12px;
         spacing: 8px;
 
-        // Top bar: connection status on the left, a Help button on the right.
+        // Top bar: connection status on the left, a general status line in the
+        // middle, a Help button on the right.
         HorizontalBox {
             alignment: space-between;
             Text {
@@ -181,6 +218,14 @@ export component MainWindow inherits Window {
                 color: #9aa0a6;
                 font-size: 13px;
                 vertical-alignment: center;
+            }
+            if root.app-status != "": Text {
+                text: root.app-status;
+                color: root.app-status-is-error ? #f28b82 : #81c995;
+                font-size: 13px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                wrap: word-wrap;
             }
             Button {
                 text: "Help";
@@ -190,17 +235,122 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Video surface placeholder. The decode loop will push DecodedFrame
-        // buffers here (as an Image) once hardware decoding is wired up.
-        Rectangle {
+        // Video surface. When a decoded frame has arrived it is drawn as an
+        // Image; otherwise a fallback placeholder plus the live pipeline status
+        // are shown so the user always sees connection progress or errors.
+        video := Rectangle {
             background: black;
             border-radius: 4px;
             vertical-stretch: 1;
-            Text {
-                text: "Video surface";
-                color: #5f6368;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+
+            // The decoded frame, scaled to fit. When `frame` is empty the Image
+            // draws nothing and the fallback below shows through.
+            Image {
+                source: root.frame;
+                image-fit: contain;
+                width: 100%;
+                height: 100%;
+            }
+
+            // Pointer input over the video surface. Taps/moves are reported to
+            // Rust as NORMALIZED coordinates (0.0..=1.0 across the surface) plus
+            // a pressed flag; ui.rs scales them to the device resolution and
+            // forwards them through the scrcpy control sink. Only active once
+            // mirroring has started (the menu is hidden).
+            if !root.menu-visible: TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    root.video-pointer(
+                        self.mouse-x / video.width,
+                        self.mouse-y / video.height,
+                        true,
+                    );
+                }
+            }
+
+            // Fallback placeholder + live pipeline status. Hidden once a real
+            // frame is present (width > 0 means a frame was set).
+            if root.frame.width == 0: VerticalBox {
+                alignment: center;
+                Text {
+                    text: "No video yet";
+                    color: #5f6368;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                // Live pipeline status/error, fed from the adb pipeline channel.
+                Text {
+                    text: root.pipeline-status;
+                    color: root.pipeline-status-is-error ? #f28b82 : #81c995;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // Landing / start menu, centered over the window on launch. Hidden once the
+    // user clicks Start. Buttons: Start, Check for updates, Help, Quit.
+    if root.menu-visible: Rectangle {
+        // Dim the backdrop so the menu reads as a modal landing panel.
+        background: #000000cc;
+
+        Rectangle {
+            width: min(360px, parent.width - 48px);
+            height: min(360px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #202124;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #3c4043;
+
+            VerticalBox {
+                padding: 20px;
+                spacing: 12px;
+                alignment: center;
+
+                Text {
+                    text: "FluxBridge";
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: white;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Mirror and control your phone from this PC.";
+                    color: #9aa0a6;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Button {
+                    text: "Start";
+                    primary: true;
+                    clicked => {
+                        root.start();
+                    }
+                }
+                Button {
+                    text: "Check for updates";
+                    clicked => {
+                        root.check-for-updates();
+                    }
+                }
+                Button {
+                    text: "Help";
+                    clicked => {
+                        root.help-toggle();
+                    }
+                }
+                Button {
+                    text: "Quit";
+                    clicked => {
+                        root.quit();
+                    }
+                }
             }
         }
     }

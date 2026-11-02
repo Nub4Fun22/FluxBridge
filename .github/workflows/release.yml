@@ -8,6 +8,9 @@
 #
 # This job runs on GitHub's hosted windows-latest runner, NOT in the Linux dev
 # sandbox. It is validated here only as YAML.
+#
+# NOTE: this workflow file is merged via PULL REQUEST only. It is edited in the
+# working tree here but never pushed directly to a default branch by the agent.
 
 name: release
 
@@ -55,17 +58,59 @@ jobs:
       #    panic="abort"), so this is just a plain --release build. The desktop
       #    GUI lives behind the OFF-by-default `gui` cargo feature, so the
       #    release build MUST enable it to produce the actual windowed client.
+      #    build.rs embeds assets/icon.ico into the .exe on Windows via the
+      #    Windows-only `embed-resource` build dependency.
+      #
+      #    For v1 this builds `--features gui` and intentionally does NOT enable
+      #    `decode`. The real FFmpeg H.264 decode path (the `decode` feature,
+      #    backed by ffmpeg-next) needs libav development libraries on the
+      #    runner. Provisioning them is a documented follow-up: add a step that
+      #    installs FFmpeg dev libs via vcpkg (for example
+      #    `vcpkg install ffmpeg:x64-windows`) and exports the environment
+      #    variables ffmpeg-next needs (FFMPEG_DIR / PKG_CONFIG_PATH), then
+      #    build with `--features gui,decode`. Keeping decode off here lets the
+      #    release link without FFmpeg provisioning while the icon, GUI and
+      #    installer paths are exercised end to end.
       - name: Build release binary (GUI)
         run: cargo build --release --features gui --bin fluxbridge-desktop
 
-      # 5. Package the portable .zip containing the built .exe.
+      # 4b. Obtain the upstream scrcpy server jar and stage it next to the .exe.
+      #     The mirroring pipeline pushes this jar to the device and resolves it
+      #     relative to the executable directory (PipelineConfig::resolve_server_jar
+      #     in crates/desktop/src/pipeline.rs), and the installer bundles it from
+      #     target\release\scrcpy-server.jar (see installer/fluxbridge.iss). The
+      #     .jar is the MIT-licensed upstream scrcpy-server and is deliberately
+      #     NOT vendored into this repository, so CI fetches the release asset
+      #     whose version matches SCRCPY_SERVER_VERSION ("2.4") in
+      #     crates/desktop/src/adb.rs. If the pinned version ever changes, bump
+      #     SCRCPY_VERSION here and SCRCPY_SERVER_VERSION in adb.rs together.
+      #     scrcpy is MIT-licensed; its LICENSE is staged alongside the jar and
+      #     shipped by the installer (and the portable zip) for compliance.
+      - name: Fetch scrcpy server jar
+        shell: pwsh
+        env:
+          SCRCPY_VERSION: "2.4"
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          $base = "https://github.com/Genymobile/scrcpy/releases/download/v$env:SCRCPY_VERSION"
+          Invoke-WebRequest -Uri "$base/scrcpy-server-v$env:SCRCPY_VERSION" `
+            -OutFile "target\release\scrcpy-server.jar"
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Genymobile/scrcpy/v$env:SCRCPY_VERSION/LICENSE" `
+            -OutFile "target\release\scrcpy-server-LICENSE"
+
+      # 5. Package the portable .zip containing the built .exe AND the scrcpy
+      #    server jar beside it, so the portable build can mirror without a
+      #    separate download (resolve_server_jar looks next to the .exe).
       #    github.ref_name is the tag that triggered the run (for example v1.2.0).
       - name: Package portable zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive `
-            -Path target\release\fluxbridge-desktop.exe `
+            -Path target\release\fluxbridge-desktop.exe, `
+                  target\release\scrcpy-server.jar, `
+                  target\release\scrcpy-server-LICENSE `
             -DestinationPath "dist\FluxBridge-${{ github.ref_name }}-portable.zip" `
             -Force
 
