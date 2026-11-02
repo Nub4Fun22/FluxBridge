@@ -134,7 +134,7 @@ afterward, rather than shipping a weaker view-only experience.
 
 The device-side server is the upstream, MIT-licensed **scrcpy server** jar,
 pushed to `/data/local/tmp` and launched with `app_process` (no app install).
-FluxBridge targets scrcpy server version `2.4`; the jar is bundled on the
+FluxBridge targets scrcpy server version `5.0.1`; the jar is bundled on the
 Windows side and is not vendored into this repo. See
 [`android-server/README.md`](android-server/README.md) for the full rationale.
 

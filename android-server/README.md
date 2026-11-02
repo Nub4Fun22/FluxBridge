@@ -10,7 +10,7 @@
 > battle-tested H.264 capture + input-injection server on day one instead of a
 > half-finished bespoke one.
 >
-> * **Targeted scrcpy server version:** `2.4` (see `SCRCPY_SERVER_VERSION` in
+> * **Targeted scrcpy server version:** `5.0.1` (see `SCRCPY_SERVER_VERSION` in
 >   `crates/desktop/src/adb.rs`). The desktop client passes this version string
 >   to `com.genymobile.scrcpy.Server`; the pushed jar must match.
 > * **Where the jar comes from:** it is obtained and bundled on the **Windows

@@ -110,7 +110,7 @@ Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; PipelineConfig::resolve_server_jar in crates/desktop/src/pipeline.rs), so it
 ; MUST land in {app} beside fluxbridge-desktop.exe.
 ;
-; The jar is the upstream MIT-licensed scrcpy-server (version 2.4, matching
+; The jar is the upstream MIT-licensed scrcpy-server (version 5.0.1, matching
 ; SCRCPY_SERVER_VERSION in crates/desktop/src/adb.rs). It is deliberately NOT
 ; vendored into this repository; the CI/packaging job obtains it and places it
 ; at ..\target\release\scrcpy-server.jar before ISCC runs (see

@@ -27,7 +27,7 @@
 //! MIT-licensed `scrcpy-server` jar: the jar is pushed to
 //! `/data/local/tmp/scrcpy-server.jar` and launched with `app_process` under
 //! the shell UID, exactly as the scrcpy project does. The client targets
-//! scrcpy server protocol version [`SCRCPY_SERVER_VERSION`]. The jar itself is
+//! scrcpy server protocol version [`SCRCPY_SERVER_VERSION`] (5.0.1). The jar itself is
 //! obtained and bundled on the Windows packaging side (see
 //! `android-server/README.md`); it is deliberately NOT vendored into this
 //! repository. The Kotlin skeleton under `android-server/` is retained only as
@@ -43,7 +43,12 @@ use std::process::{Child, Command, Output, Stdio};
 /// as the first positional argument to
 /// `com.genymobile.scrcpy.Server`, and scrcpy aborts if the version string does
 /// not match the jar it was built from.
-pub const SCRCPY_SERVER_VERSION: &str = "2.4";
+///
+/// Pinned to scrcpy 5.0.1 (latest stable, supports Android 17). The client's
+/// video-header and packet-flag parsing in [`crate::scrcpy`] follows the 5.0.1
+/// wire format. `.github/workflows/release.yml` (`SCRCPY_VERSION`) must stay in
+/// lockstep with this value so the fetched jar matches.
+pub const SCRCPY_SERVER_VERSION: &str = "5.0.1";
 
 /// On-device path the scrcpy server jar is pushed to.
 pub const DEVICE_SERVER_PATH: &str = "/data/local/tmp/scrcpy-server.jar";
@@ -1270,7 +1275,7 @@ mod tests {
                 "app_process",
                 "/",
                 "com.genymobile.scrcpy.Server",
-                "2.4",
+                "5.0.1",
                 "log_level=info",
                 "max_size=0",
                 "video_bit_rate=8000000",
@@ -1302,7 +1307,7 @@ mod tests {
                 "app_process",
                 "/",
                 "com.genymobile.scrcpy.Server",
-                "2.4",
+                "5.0.1",
                 "log_level=info",
                 "max_size=1280",
                 "video_bit_rate=4000000",
@@ -1322,7 +1327,7 @@ mod tests {
     /// "dummy byte: failed to fill whole buffer" failure). Locking them
     /// together here means the pinned constant and the launch command can never
     /// silently diverge. (The workflow side of the version agreement, that the
-    /// downloaded jar is the matching v2.4 upstream asset, is covered in the
+    /// downloaded jar is the matching v5.0.1 upstream asset, is covered in the
     /// release workflow.)
     #[test]
     fn server_launch_args_version_is_first_positional_after_class() {
@@ -1344,6 +1349,15 @@ mod tests {
                  SCRCPY_SERVER_VERSION so the client and jar versions cannot diverge"
             );
         }
+    }
+
+    /// Pin the exact scrcpy server version so an accidental revert fails loudly.
+    /// The client's 5.0.1 video-header (session-flags word) and packet-flag bit
+    /// parsing in [`crate::scrcpy`] depend on this being 5.0.1, and
+    /// `.github/workflows/release.yml` must fetch the matching jar.
+    #[test]
+    fn scrcpy_server_version_is_pinned_to_5_0_1() {
+        assert_eq!(SCRCPY_SERVER_VERSION, "5.0.1");
     }
 
     #[test]
