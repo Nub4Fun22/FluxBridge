@@ -348,6 +348,201 @@ fn report(tx: &Sender<PipelineStatus>, status: PipelineStatus) {
     let _ = tx.send(status);
 }
 
+/// How many of the scrcpy server's most recent output lines are retained for
+/// the error path. Bounded so a chatty server cannot grow memory without limit.
+const SERVER_OUTPUT_LINES: usize = 50;
+
+/// Total time budget for the forward-mode video connect + dummy-byte retry.
+/// scrcpy's own client retries because `adb forward` can accept the local
+/// connection before the device-side server is listening; this mirrors that
+/// with a short bound so a genuinely dead server still fails quickly.
+const DUMMY_BYTE_RETRY_ATTEMPTS: u32 = 20;
+/// Backoff between dummy-byte retry attempts (20 attempts x 100ms ~= 2s total).
+const DUMMY_BYTE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Read timeout on the forward-mode video socket while waiting for the dummy
+/// byte, so a silent server surfaces a would-block the retry loop can act on
+/// instead of blocking forever.
+const DUMMY_BYTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Short bounded grace wait before snapshotting the server output on the
+/// failure path. The server's stdout/stderr are drained by detached reader
+/// threads (see [`spawn_server_output_reader`]); when the stream fails to start
+/// the snapshot is taken synchronously, which can race those threads so the
+/// server's final lines (the version mismatch or stack trace that explains the
+/// failure) have not been parsed and pushed yet. A brief wait gives the readers
+/// a chance to flush before the snapshot. It is well under a second and is only
+/// paid on the error path, never on the happy streaming path; a silent server
+/// still ends up with an empty buffer and the explicit "(no output captured)".
+const SERVER_OUTPUT_GRACE_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// A bounded, thread-safe ring buffer of the scrcpy server's most recent output
+/// lines, so a server-side startup failure (a version mismatch, an
+/// `app_process` error, an unsupported option, a Java stack trace) can be
+/// surfaced in the pipeline's error message instead of being lost to inherited
+/// stdio.
+///
+/// The server child's stdout/stderr are drained on a background thread (see
+/// [`spawn_server_output_reader`]) into one of these; the error path snapshots
+/// the last lines with [`ServerOutputBuffer::snapshot`]. The capture and
+/// snapshot logic is a pure, unit-testable seam driven in tests by any
+/// [`std::io::Read`] (a `Cursor` of fake server stderr), with no real `Child`.
+#[derive(Clone, Default)]
+pub struct ServerOutputBuffer {
+    lines: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl ServerOutputBuffer {
+    /// Create an empty buffer.
+    pub fn new() -> Self {
+        ServerOutputBuffer {
+            lines: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        }
+    }
+
+    /// Append one line, evicting the oldest so at most [`SERVER_OUTPUT_LINES`]
+    /// are retained. Trailing carriage returns/newlines are trimmed so Windows
+    /// adb output does not leave stray `\r` in the captured text.
+    pub fn push_line(&self, line: &str) {
+        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        if let Ok(mut guard) = self.lines.lock() {
+            if guard.len() >= SERVER_OUTPUT_LINES {
+                guard.pop_front();
+            }
+            guard.push_back(trimmed);
+        }
+    }
+
+    /// Drain every line from `reader` (the child's piped stdout/stderr) into the
+    /// buffer, returning cleanly when the pipe closes (read returns EOF). This
+    /// is what the reader thread runs; it is also called directly in tests with
+    /// an in-memory `Read`.
+    pub fn drain_from<R: std::io::Read>(&self, reader: R) {
+        use std::io::BufRead;
+        let buffered = std::io::BufReader::new(reader);
+        for line in buffered.lines() {
+            match line {
+                Ok(l) => self.push_line(&l),
+                Err(_) => break, // pipe closed or decode error; stop cleanly
+            }
+        }
+    }
+
+    /// Snapshot the last `k` captured lines as a single newline-joined string.
+    ///
+    /// Returns `None` when nothing has been captured, so the caller can tell a
+    /// silent server apart from one that logged a diagnostic.
+    pub fn snapshot(&self, k: usize) -> Option<String> {
+        let guard = self.lines.lock().ok()?;
+        if guard.is_empty() {
+            return None;
+        }
+        let start = guard.len().saturating_sub(k);
+        let joined = guard
+            .iter()
+            .skip(start)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(joined)
+    }
+}
+
+/// Spawn background threads that drain the server child's stdout and stderr into
+/// `buffer`, so a chatty or silent server never deadlocks the pipeline and its
+/// output is available for the error path.
+///
+/// Each thread owns its pipe handle and exits cleanly when that pipe closes (on
+/// server exit or when the child is killed during teardown). The threads are
+/// detached: they are short-lived relative to the pipeline and tear themselves
+/// down on EOF, so there is no join handle to manage.
+fn spawn_server_output_reader(child: &mut std::process::Child, buffer: &ServerOutputBuffer) {
+    if let Some(stdout) = child.stdout.take() {
+        let buf = buffer.clone();
+        std::thread::spawn(move || buf.drain_from(stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let buf = buffer.clone();
+        std::thread::spawn(move || buf.drain_from(stderr));
+    }
+}
+
+/// Snapshot the captured server output for the error path after a short bounded
+/// grace wait (see [`SERVER_OUTPUT_GRACE_WAIT`]).
+///
+/// The reader threads drain the server's pipes independently, so at the instant
+/// the stream-start retry gives up the server's final lines may not be parsed
+/// and pushed yet. The brief wait lets the readers flush so a server that
+/// printed its failure reason is reliably reflected in the error, rather than
+/// losing those lines to a thread-scheduling race. The wait is bounded and
+/// never blocks indefinitely: a silent server simply still yields an empty
+/// snapshot and the explicit "(no output captured)".
+fn snapshot_server_output_after_grace(server_output: &ServerOutputBuffer) -> Option<String> {
+    std::thread::sleep(SERVER_OUTPUT_GRACE_WAIT);
+    server_output.snapshot(SERVER_OUTPUT_LINES)
+}
+
+/// Build the actionable error message shown when the forward-mode stream cannot
+/// start (the dummy-byte retry was exhausted or the header parse hit EOF at the
+/// very start of the stream).
+///
+/// It names the underlying I/O problem, then includes the last captured server
+/// output (or an explicit "(no output captured)" when the server printed
+/// nothing, so silence is distinguishable from a captured message), then a
+/// concrete hint. No em dashes anywhere.
+fn stream_start_error(detail: &str, server_output: Option<String>) -> String {
+    let said = match server_output {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => "(no output captured)".to_string(),
+    };
+    format!(
+        "scrcpy stream did not start: {detail}. Server said: {said}. \
+         Try re-pairing in Wireless debugging, toggle Wireless debugging off and on, \
+         and confirm the phone's Android version is 11 or newer."
+    )
+}
+
+/// Whether a connect error is the forward-mode readiness race (worth retrying)
+/// rather than a hard failure. `adb forward` accepting while the device-side
+/// server is not yet listening surfaces as connection-refused (and, on some
+/// platforms, a connection-reset or timed-out), so those are retried; anything
+/// else is returned to the caller immediately.
+fn is_retryable_connect_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Connect the forward-mode video socket with a bounded retry/backoff, mirroring
+/// scrcpy's own forward-mode connect loop. Retries a retryable connect error
+/// (see [`is_retryable_connect_error`]) up to the dummy-byte attempt bound with
+/// the same backoff, giving up with the last error afterwards.
+fn connect_forward_video(addr: &str) -> std::io::Result<std::net::TcpStream> {
+    let mut last = None;
+    for attempt in 0..DUMMY_BYTE_RETRY_ATTEMPTS {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) if is_retryable_connect_error(&e) => {
+                last = Some(e);
+                if attempt + 1 < DUMMY_BYTE_RETRY_ATTEMPTS {
+                    std::thread::sleep(DUMMY_BYTE_RETRY_BACKOFF);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "forward-mode video connect retries exhausted",
+        )
+    }))
+}
+
 /// Locate adb, auto-provisioning it if it cannot be found.
 ///
 /// First tries [`crate::adb::locate_or_provisioned`] (which prefers a bundled
@@ -573,20 +768,32 @@ pub fn run_pipeline_full(
         return Ok(());
     }
 
-    // 5. Launch the scrcpy server.
-    let mut server_child = match cmd.spawn(&adb::server_launch_args(&selector, &config.server_opts))
-    {
-        Ok(child) => child,
-        Err(e) => {
-            teardown_with(&cmd, config, &selector);
-            report(status, PipelineStatus::Error(e.to_string()));
-            return Err(e);
-        }
-    };
+    // 5. Launch the scrcpy server with its stdout/stderr CAPTURED (not
+    //    inherited) so a server-side startup failure is visible in the error
+    //    path instead of being lost. A background reader drains both pipes into
+    //    a bounded buffer so a chatty or silent server never blocks us.
+    let mut server_child =
+        match cmd.spawn_capturing(&adb::server_launch_args(&selector, &config.server_opts)) {
+            Ok(child) => child,
+            Err(e) => {
+                teardown_with(&cmd, config, &selector);
+                report(status, PipelineStatus::Error(e.to_string()));
+                return Err(e);
+            }
+        };
+    let server_output = ServerOutputBuffer::new();
+    spawn_server_output_reader(&mut server_child, &server_output);
     report(status, PipelineStatus::ServerLaunched);
 
     // 6. Connect the forwarded socket(s) and run the scrcpy stream.
-    let result = run_stream(config, status, frame_sink, control_sink.as_deref(), cancel);
+    let result = run_stream(
+        config,
+        status,
+        frame_sink,
+        control_sink.as_deref(),
+        &server_output,
+        cancel,
+    );
 
     // Teardown: kill the server child and remove the forward.
     let _ = server_child.kill();
@@ -619,6 +826,7 @@ fn run_stream(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
     control_sink: Option<&ControlSinkSlot>,
+    server_output: &ServerOutputBuffer,
     cancel: Option<&CancelFlag>,
 ) -> Result<(), adb::AdbError> {
     use std::net::TcpStream;
@@ -631,13 +839,34 @@ fn run_stream(
     }
 
     let addr = format!("{}:{}", crate::connection::DEFAULT_HOST, config.local_port);
+    let tunnel_forward = config.server_opts.tunnel_forward;
 
-    // First connection on the forwarded socket is the video stream.
-    let mut video = match TcpStream::connect(&addr) {
-        Ok(s) => s,
-        Err(e) => {
-            report(status, PipelineStatus::Error(format!("video socket {addr}: {e}")));
-            return Ok(());
+    // First connection on the forwarded socket is the video stream. In
+    // tunnel-forward mode `adb forward` can accept this local connection before
+    // the device-side server is actually listening, so scrcpy's own client
+    // retries the connect. Mirror that with a bounded retry on connection
+    // refused; in reverse mode a single connect attempt is enough.
+    let mut video = if tunnel_forward {
+        match connect_forward_video(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                report(
+                    status,
+                    PipelineStatus::Error(stream_start_error(
+                        &format!("video socket {addr}: {e}"),
+                        snapshot_server_output_after_grace(server_output),
+                    )),
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        match TcpStream::connect(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                report(status, PipelineStatus::Error(format!("video socket {addr}: {e}")));
+                return Ok(());
+            }
         }
     };
     // Use a SHORT read timeout (not the old 30s) so a blocked read on a stalled
@@ -704,20 +933,66 @@ fn run_stream(
     // and parse the header here, build the control sink, then run the shared
     // access-unit loop (scrcpy::stream_av_packets) to feed the decoder. The
     // all-in-one scrcpy::stream_video is the headless-testable equivalent.
-    let tunnel_forward = config.server_opts.tunnel_forward;
 
     // Consume the dummy byte and header up front so the control sink can be
-    // sized from the real device resolution before frames start flowing.
+    // sized from the real device resolution before frames start flowing. In
+    // tunnel-forward mode the first read can see an early EOF (the forward is
+    // accepted before the server writes), so the dummy-byte read is retried
+    // with a bounded backoff. A short read timeout turns a silent server into a
+    // retryable would-block instead of an indefinite block. When the retry is
+    // exhausted the captured server output is surfaced in the error.
     if tunnel_forward {
-        if let Err(e) = crate::scrcpy::consume_dummy_byte(&mut video) {
-            report(status, PipelineStatus::Error(format!("scrcpy dummy byte: {e}")));
+        let _ = video.set_read_timeout(Some(DUMMY_BYTE_READ_TIMEOUT));
+        let dummy = crate::scrcpy::consume_dummy_byte_retrying(
+            &mut video,
+            DUMMY_BYTE_RETRY_ATTEMPTS,
+            || {
+                // Honor a Stop requested WHILE we are still waiting for a server
+                // that never starts streaming: returning false from this seam
+                // aborts the retry loop immediately so "Stop mirroring" tears
+                // down promptly instead of waiting out the full ~2s retry
+                // budget. On a live run the cancel flag is None (headless) or
+                // the per-run CancelFlag the UI trips on Stop.
+                if is_cancelled(cancel) {
+                    return false;
+                }
+                std::thread::sleep(DUMMY_BYTE_RETRY_BACKOFF);
+                true
+            },
+        );
+        // Restore the longer streaming read timeout for the access-unit loop so
+        // a blocked read wakes every STREAM_READ_TIMEOUT to observe the cancel
+        // flag during the streaming access-unit loop below.
+        let _ = video.set_read_timeout(Some(STREAM_READ_TIMEOUT));
+        // A stop requested during the dummy-byte wait: the retry seam above
+        // aborted early, so return cleanly and let the caller run teardown once.
+        if is_cancelled(cancel) {
+            return Ok(());
+        }
+        if let Err(e) = dummy {
+            report(
+                status,
+                PipelineStatus::Error(stream_start_error(
+                    &format!("dummy byte: {e}"),
+                    snapshot_server_output_after_grace(server_output),
+                )),
+            );
             return Ok(());
         }
     }
     let header = match crate::scrcpy::parse_video_header(&mut video) {
         Ok(h) => h,
         Err(e) => {
-            report(status, PipelineStatus::Error(format!("scrcpy video header: {e}")));
+            // An EOF at the very start of the header is the same class of
+            // failure as the dummy-byte EOF (the server closed the socket), so
+            // surface the captured server output and actionable hint too.
+            report(
+                status,
+                PipelineStatus::Error(stream_start_error(
+                    &format!("video header: {e}"),
+                    snapshot_server_output_after_grace(server_output),
+                )),
+            );
             return Ok(());
         }
     };
@@ -1145,6 +1420,152 @@ mod tests {
             matches!(statuses.last(), Some(PipelineStatus::Error(_))),
             "an Error status must be reported, got {statuses:?}"
         );
+    }
+
+    /// The server-output ring buffer keeps only the last N lines (evicting the
+    /// oldest) and snapshots the last K in order, trimming trailing CR/LF so
+    /// Windows adb output does not leave stray carriage returns.
+    #[test]
+    fn server_output_buffer_keeps_last_lines_in_order() {
+        let buf = ServerOutputBuffer::new();
+        // Empty buffer snapshots to None so silence is distinguishable.
+        assert!(buf.snapshot(5).is_none());
+
+        for i in 0..(SERVER_OUTPUT_LINES + 10) {
+            buf.push_line(&format!("line {i}\r\n"));
+        }
+        // Only the last SERVER_OUTPUT_LINES are retained.
+        let all = buf.snapshot(SERVER_OUTPUT_LINES).unwrap();
+        let lines: Vec<&str> = all.lines().collect();
+        assert_eq!(lines.len(), SERVER_OUTPUT_LINES);
+        // Oldest retained line is (total - N); newest is the last pushed.
+        let total = SERVER_OUTPUT_LINES + 10;
+        assert_eq!(lines[0], format!("line {}", total - SERVER_OUTPUT_LINES));
+        assert_eq!(lines[lines.len() - 1], format!("line {}", total - 1));
+        // Trailing CR/LF were trimmed.
+        assert!(!all.contains('\r'));
+
+        // Snapshot of the last K returns exactly K lines, in order.
+        let last3 = buf.snapshot(3).unwrap();
+        let last3_lines: Vec<&str> = last3.lines().collect();
+        assert_eq!(last3_lines.len(), 3);
+        assert_eq!(last3_lines[2], format!("line {}", total - 1));
+    }
+
+    /// The ring buffer drains a Read (the headless stand-in for the child's
+    /// piped stderr) line by line and returns cleanly at EOF.
+    #[test]
+    fn server_output_buffer_drains_a_reader_to_eof() {
+        let buf = ServerOutputBuffer::new();
+        let fake_stderr = b"[server] ERROR: could not parse option\nExit\n".to_vec();
+        buf.drain_from(std::io::Cursor::new(fake_stderr));
+        let snap = buf.snapshot(SERVER_OUTPUT_LINES).unwrap();
+        assert!(snap.contains("could not parse option"));
+        assert!(snap.contains("Exit"));
+    }
+
+    /// An immediate-EOF dummy-byte read, combined with captured server output,
+    /// produces an error that INCLUDES the server's text plus the actionable
+    /// hint. This is the diagnosable-failure acceptance criterion, exercised
+    /// with an in-memory Read seam and a fake server-output source (no socket).
+    #[test]
+    fn immediate_eof_dummy_byte_surfaces_captured_server_output() {
+        // Fake captured server output: the kind of stderr a mismatched/failed
+        // server prints before closing the socket.
+        let server_output = ServerOutputBuffer::new();
+        server_output.drain_from(std::io::Cursor::new(
+            b"[server] ERROR: The server version does not match the client\n".to_vec(),
+        ));
+
+        // A video stream at immediate EOF (0 bytes), the exact condition that
+        // produced "dummy byte: failed to fill whole buffer".
+        let mut stream = std::io::Cursor::new(Vec::<u8>::new());
+        let dummy = crate::scrcpy::consume_dummy_byte_retrying(&mut stream, 3, || true);
+        let err = dummy.unwrap_err();
+
+        let message = stream_start_error(
+            &format!("dummy byte: {err}"),
+            server_output.snapshot(SERVER_OUTPUT_LINES),
+        );
+        // The captured server line appears verbatim in the surfaced error.
+        assert!(
+            message.contains("The server version does not match the client"),
+            "error must include captured server output, got: {message}"
+        );
+        // And the actionable hint is present.
+        assert!(message.contains("Wireless debugging"));
+        assert!(message.contains("Android version is 11"));
+        // No em dashes anywhere in the copy.
+        assert!(!message.contains('\u{2014}'));
+    }
+
+    /// When nothing was captured (a server that exited before logging), the
+    /// error says so explicitly so silence is distinguishable from a message.
+    #[test]
+    fn stream_start_error_reports_no_output_when_buffer_empty() {
+        let empty = ServerOutputBuffer::new();
+        let message = stream_start_error("dummy byte: timeout", empty.snapshot(SERVER_OUTPUT_LINES));
+        assert!(message.contains("(no output captured)"), "{message}");
+        assert!(message.contains("Wireless debugging"));
+        assert!(!message.contains('\u{2014}'));
+    }
+
+    /// The grace-drain snapshot reliably reflects server output that was pushed
+    /// around the time of the failure, so the diagnosable-failure guarantee is
+    /// not best-effort. A line captured before the snapshot must appear in the
+    /// surfaced error. This exercises the buffer/snapshot/error-message
+    /// contract directly rather than relying on real reader-thread timing.
+    #[test]
+    fn grace_snapshot_includes_server_output_pushed_before_failure() {
+        let server_output = ServerOutputBuffer::new();
+        // The server printed its reason and closed the socket; the line is in
+        // the buffer by the time the error path snapshots it.
+        server_output.push_line("[server] ERROR: app_process failed to start");
+
+        let snap = snapshot_server_output_after_grace(&server_output);
+        let message = stream_start_error("dummy byte: unexpected EOF", snap);
+
+        assert!(
+            message.contains("app_process failed to start"),
+            "grace snapshot must surface the captured server line, got: {message}"
+        );
+        assert!(message.contains("Wireless debugging"));
+        assert!(!message.contains("(no output captured)"));
+        assert!(!message.contains('\u{2014}'));
+    }
+
+    /// The grace drain must not invent output: a server that was genuinely
+    /// silent still yields an empty snapshot and the explicit
+    /// "(no output captured)", so the bounded wait never masks real silence.
+    #[test]
+    fn grace_snapshot_stays_empty_for_a_silent_server() {
+        let server_output = ServerOutputBuffer::new();
+        let snap = snapshot_server_output_after_grace(&server_output);
+        assert!(snap.is_none(), "a silent server must snapshot to None");
+
+        let message = stream_start_error("dummy byte: unexpected EOF", snap);
+        assert!(message.contains("(no output captured)"), "{message}");
+        assert!(!message.contains('\u{2014}'));
+    }
+
+    /// Connect errors are classified so the forward-mode readiness race
+    /// (connection refused/reset/aborted/timed-out) is retried while a hard
+    /// error is not.
+    #[test]
+    fn connect_error_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_retryable_connect_error(&Error::new(
+            ErrorKind::ConnectionRefused,
+            "x"
+        )));
+        assert!(is_retryable_connect_error(&Error::new(
+            ErrorKind::TimedOut,
+            "x"
+        )));
+        assert!(!is_retryable_connect_error(&Error::new(
+            ErrorKind::PermissionDenied,
+            "x"
+        )));
     }
 
     #[test]

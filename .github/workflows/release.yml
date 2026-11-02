@@ -110,10 +110,64 @@ jobs:
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path target\release | Out-Null
           $base = "https://github.com/Genymobile/scrcpy/releases/download/v$env:SCRCPY_VERSION"
-          Invoke-WebRequest -Uri "$base/scrcpy-server-v$env:SCRCPY_VERSION" `
-            -OutFile "target\release\scrcpy-server.jar"
+          $jarPath = "target\release\scrcpy-server.jar"
+          $asset = "scrcpy-server-v$env:SCRCPY_VERSION"
+          Invoke-WebRequest -Uri "$base/$asset" `
+            -OutFile $jarPath
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Genymobile/scrcpy/v$env:SCRCPY_VERSION/LICENSE" `
             -OutFile "target\release\scrcpy-server-LICENSE"
+
+          # Validate the downloaded jar BEFORE it is packaged. Invoke-WebRequest
+          # writes whatever the server returns, so a GitHub outage serving an
+          # HTML error page or a truncated/zero-byte response would otherwise be
+          # shipped silently as a corrupt scrcpy-server.jar. A corrupt jar makes
+          # the scrcpy server abort the moment it starts, which surfaces on the
+          # client as "scrcpy dummy byte: failed to fill whole buffer" (the
+          # stream handshake read reaches EOF immediately). Fail the release here
+          # instead of shipping a broken jar.
+          if (-not (Test-Path $jarPath)) {
+            throw "scrcpy server download failed: expected asset '$asset' from $base was not written to $jarPath."
+          }
+          $size = (Get-Item $jarPath).Length
+          # The real v2.4 asset is ~69 KB. Anything well under 10 KB is an error
+          # page or a truncated download, not the jar.
+          if ($size -lt 10000) {
+            throw "scrcpy server download looks corrupt: '$asset' is only $size bytes (expected roughly 69 KB). This usually means GitHub served an error page or a truncated download."
+          }
+          # A real ZIP/JAR begins with the magic bytes 'PK' (0x50 0x4B). An HTML
+          # error page would begin with '<' (0x3C), so this catches a bad body
+          # even when it happens to be large.
+          $magic = [System.IO.File]::ReadAllBytes($jarPath)[0..1]
+          if ($magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) {
+            $hex = ('0x{0:X2} 0x{1:X2}' -f $magic[0], $magic[1])
+            throw "scrcpy server download is not a valid jar: '$asset' does not start with the ZIP/JAR 'PK' magic bytes (got $hex). The download is probably an HTML error page or corrupt."
+          }
+          # Strengthen with the official checksum when the release publishes
+          # SHA256SUMS.txt. The file lists one "<sha256>  <filename>" line per
+          # asset; find the line for our asset, compare it to the computed hash,
+          # and fail on mismatch. If the checksum list is unavailable the magic
+          # byte and size checks above remain the hard gate.
+          try {
+            $sumsPath = "target\release\scrcpy-SHA256SUMS.txt"
+            Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile $sumsPath
+          } catch {
+            Write-Host "SHA256SUMS.txt not available for v$env:SCRCPY_VERSION; relying on size and magic-byte validation."
+            $sumsPath = $null
+          }
+          if ($sumsPath -and (Test-Path $sumsPath)) {
+            $expectedLine = Get-Content $sumsPath | Where-Object { $_ -match "\b$([regex]::Escape($asset))$" } | Select-Object -First 1
+            if (-not $expectedLine) {
+              Write-Host "No SHA256 entry for '$asset' in SHA256SUMS.txt; relying on size and magic-byte validation."
+            } else {
+              $expected = ($expectedLine -split '\s+')[0].ToLower()
+              $actual = (Get-FileHash -Algorithm SHA256 -Path $jarPath).Hash.ToLower()
+              if ($expected -ne $actual) {
+                throw "scrcpy server checksum mismatch for '$asset': expected $expected but downloaded file is $actual."
+              }
+              Write-Host "scrcpy server SHA256 verified for '$asset'."
+            }
+          }
+          Write-Host "scrcpy server jar validated: $asset ($size bytes)."
 
       # 5. Package the portable .zip containing the built .exe AND the scrcpy
       #    server jar beside it, so the portable build can mirror without a
