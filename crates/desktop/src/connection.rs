@@ -282,4 +282,90 @@ mod tests {
     fn mdns_stub_returns_none() {
         assert!(discover_via_mdns().is_none());
     }
+
+    /// End-to-end loopback test of the socket seam: handshake over the real
+    /// `PacketCodec`, then a `VideoFrame` streamed through `run_decode_loop`.
+    ///
+    /// A `TcpListener` on `127.0.0.1:0` plays the device server. It reads the
+    /// client's `Handshake`, replies with its own `Handshake`, then sends a
+    /// single `VideoFrame`. The client connects via [`Connection::connect`]
+    /// (which completes the handshake and spawns the reader thread), and the
+    /// decode loop consumes the frame off the packet channel. This covers the
+    /// framing-over-TCP path that the config-string unit tests do not touch.
+    #[test]
+    fn loopback_handshake_and_frame_through_decode_loop() {
+        use crate::decode_loop::{run_decode_loop, StubDecoder};
+        use fluxbridge_core::DecodedFrame;
+        use std::net::TcpListener;
+        use std::sync::mpsc as std_mpsc;
+
+        let frame_payload = vec![0xA1u8, 0xB2, 0xC3, 0xD4];
+        let server_payload = frame_payload.clone();
+
+        // Bind to an ephemeral port so the test never collides with a real one.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Lets the client tell the server to close once it has the frame.
+        let (done_tx, done_rx) = std_mpsc::channel::<()>();
+
+        // Server side: accept one client, complete the handshake, stream a frame.
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept client");
+
+            // Read the client's Handshake and verify it frames correctly.
+            let hello = read_one_packet(&mut sock).expect("read client handshake");
+            assert_eq!(hello.packet_type, PacketType::Handshake);
+
+            // Reply with our own Handshake and flush it on its own.
+            let reply = PacketCodec::encode(&Packet::new(PacketType::Handshake, Vec::new()))
+                .expect("encode handshake reply");
+            sock.write_all(&reply).expect("write handshake reply");
+            sock.flush().expect("flush handshake reply");
+
+            // Pause so the handshake reply lands in its own read on the client.
+            // `perform_handshake` reads one packet and discards any trailing
+            // bytes in its local buffer, so the frame must arrive only after the
+            // reader thread (spawned post-handshake) is the one reading.
+            std::thread::sleep(Duration::from_millis(150));
+
+            let frame = PacketCodec::encode(&Packet::new(PacketType::VideoFrame, server_payload))
+                .expect("encode video frame");
+            sock.write_all(&frame).expect("write video frame");
+            sock.flush().expect("flush video frame");
+
+            // Keep the socket open until signaled so the client reader drains
+            // the frame before the peer closes.
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let config = ConnectionConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            read_timeout: Some(Duration::from_secs(5)),
+        };
+        let connection = Connection::connect(&config).expect("client connects + handshakes");
+
+        // Drive the decode loop on a worker thread so the main thread can wait
+        // on the decoded-frame channel with a timeout.
+        let (frame_tx, frame_rx) = std_mpsc::channel::<DecodedFrame>();
+        let decoder_thread = std::thread::spawn(move || {
+            let mut decoder = StubDecoder::new();
+            // Returns when the peer closes (reader thread drops the sender) or
+            // the frame sink is gone.
+            let _ = run_decode_loop(connection.packets(), &mut decoder, &frame_tx);
+        });
+
+        // Wait for the frame to flow all the way through the decode loop.
+        let first = frame_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a decoded frame arrives through the loop");
+        assert_eq!(first.data, frame_payload, "frame bytes survive the round trip");
+
+        // Tell the server it can close now, then let both threads wind down.
+        let _ = done_tx.send(());
+        drop(frame_rx);
+        server.join().expect("server thread");
+        decoder_thread.join().expect("decoder thread");
+    }
 }

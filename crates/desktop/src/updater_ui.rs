@@ -22,7 +22,7 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
 use fluxbridge_core::ReleaseInfo;
-use fluxbridge_updater::{GithubUpdater, HttpTransport, UpdaterResult};
+use fluxbridge_updater::{ApplyOutcome, GithubUpdater, HttpTransport, UpdaterResult};
 
 /// Default GitHub owner for the FluxBridge releases.
 pub const GITHUB_OWNER: &str = "fluxbridge";
@@ -38,8 +38,15 @@ pub enum UpdateEvent {
     UpToDate,
     /// Download progress in `0..=100`.
     Progress(u8),
-    /// The downloaded installer path, ready to apply.
-    Downloaded(String),
+    /// The installer was launched and the app must now exit so it can replace
+    /// the running binary. The payload is the installer path that was spawned.
+    /// The UI turns this into a `slint::quit_event_loop()`.
+    Applied(String),
+    /// The asset finished downloading but there is no in-app installer on this
+    /// platform, so the user must apply it manually. The payload is the path of
+    /// the downloaded file. The UI surfaces this to the user instead of
+    /// claiming the update was applied.
+    DownloadedManual(String),
     /// A step failed; the message is user-displayable.
     Failed(String),
 }
@@ -82,9 +89,19 @@ where
 
 /// Download and apply the update, streaming progress to `events`.
 ///
-/// Sends [`UpdateEvent::Progress`] values as the download proceeds, then
-/// [`UpdateEvent::Downloaded`] once applied, or [`UpdateEvent::Failed`] on
-/// error. The destination file is placed in the system temp directory.
+/// Sends [`UpdateEvent::Progress`] values as the download proceeds, then a
+/// terminal event that honestly reflects what [`GithubUpdater::apply_update`]
+/// did:
+///
+/// * [`UpdateEvent::Applied`] when the installer was launched and the app must
+///   now exit (Windows). The UI reacts by quitting the event loop.
+/// * [`UpdateEvent::DownloadedManual`] when the asset was downloaded but no
+///   in-app installer ran (the non-Windows portable stub), so the user has to
+///   apply it by hand.
+///
+/// A failure at any step propagates as `Err`; the caller maps it to
+/// [`UpdateEvent::Failed`]. The destination file is placed in the system temp
+/// directory.
 pub fn run_update<T: HttpTransport>(
     updater: &GithubUpdater<T>,
     release: &ReleaseInfo,
@@ -103,10 +120,14 @@ pub fn run_update<T: HttpTransport>(
         let _ = events_cb.send(UpdateEvent::Progress(pct));
     };
     updater.download_asset(&release.asset_url, &dest, &mut progress)?;
-    updater.apply_update(&dest)?;
+    let outcome = updater.apply_update(&dest)?;
 
     let path = dest.to_string_lossy().into_owned();
-    let _ = events.send(UpdateEvent::Downloaded(path.clone()));
+    let terminal = match outcome {
+        ApplyOutcome::ExitForInstaller => UpdateEvent::Applied(path.clone()),
+        ApplyOutcome::DownloadedApplyManually => UpdateEvent::DownloadedManual(path.clone()),
+    };
+    let _ = events.send(terminal);
     Ok(path)
 }
 
@@ -194,9 +215,20 @@ mod tests {
         let events: Vec<UpdateEvent> = rx.try_iter().collect();
         assert!(events.contains(&UpdateEvent::Progress(0)));
         assert!(events.contains(&UpdateEvent::Progress(100)));
+        // On this non-Windows host apply is a portable stub, so the terminal
+        // event must honestly report "downloaded, apply manually" rather than a
+        // success. The Windows path emits Applied instead (not exercised here).
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UpdateEvent::DownloadedManual(_) | UpdateEvent::Applied(_)
+            )),
+            "expected a terminal apply event, got {events:?}"
+        );
+        #[cfg(not(windows))]
         assert!(events
             .iter()
-            .any(|e| matches!(e, UpdateEvent::Downloaded(_))));
+            .any(|e| matches!(e, UpdateEvent::DownloadedManual(_))));
 
         let _ = std::fs::remove_file(path);
     }

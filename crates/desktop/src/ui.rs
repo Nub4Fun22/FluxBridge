@@ -114,20 +114,36 @@ fn apply_event(
             w.set_update_version(info.version.clone().into());
             w.set_update_notes(info.notes.clone().into());
             w.set_update_progress(0.0);
+            w.set_update_status("".into());
+            w.set_update_status_is_error(false);
             w.set_update_available(true);
             *current_release.borrow_mut() = Some(info);
         }
         UpdateEvent::Progress(pct) => {
             w.set_update_progress(pct as f32);
         }
-        UpdateEvent::Downloaded(_) => {
+        UpdateEvent::Applied(_) => {
+            // The installer was launched; the running binary must exit so it can
+            // be replaced. Request a clean shutdown of the Slint event loop.
             w.set_update_downloading(false);
-            w.set_update_available(false);
+            let _ = slint::quit_event_loop();
+        }
+        UpdateEvent::DownloadedManual(path) => {
+            // No in-app installer ran on this platform. Keep the dialog visible
+            // and tell the user where the download is so they can apply it,
+            // instead of hiding as if the update completed.
+            w.set_update_downloading(false);
+            w.set_update_status(
+                format!("Downloaded to {path}. Please apply the update manually.").into(),
+            );
+            w.set_update_status_is_error(false);
         }
         UpdateEvent::UpToDate => {}
-        UpdateEvent::Failed(_) => {
+        UpdateEvent::Failed(msg) => {
+            // Surface the failure in the dialog rather than silently hiding it.
             w.set_update_downloading(false);
-            w.set_update_available(false);
+            w.set_update_status(format!("Update failed: {msg}").into());
+            w.set_update_status_is_error(true);
         }
     }
 }

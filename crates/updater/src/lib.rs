@@ -45,6 +45,26 @@ use fluxbridge_core::{CoreError, CoreResult, ReleaseInfo, Updater};
 use semver::Version;
 use std::path::Path;
 
+/// The result of [`GithubUpdater::apply_update`].
+///
+/// `apply_update` cannot itself tear down the process (it has no handle on the
+/// UI event loop), so it reports what the caller must do next. This keeps the
+/// desktop UI honest: it only claims a successful update when the installer was
+/// actually launched, and tells the user to apply manually on platforms that
+/// have no in-app installer yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The platform installer was spawned and the application must now exit so
+    /// the installer can replace the running binary. On Windows the caller is
+    /// expected to request `slint::quit_event_loop()` (or otherwise exit) as
+    /// soon as it sees this.
+    ExitForInstaller,
+    /// No in-app installer ran: the asset was downloaded but the user has to
+    /// apply it by hand (the current non-Windows portable stub). The UI must
+    /// surface this instead of pretending the update was applied.
+    DownloadedApplyManually,
+}
+
 /// Parse a version string into a [`semver::Version`], stripping a leading `v`.
 fn parse_version(raw: &str) -> UpdaterResult<Version> {
     let trimmed = raw.trim();
@@ -87,15 +107,21 @@ impl<T: HttpTransport> GithubUpdater<T> {
 
     /// Check whether a newer release than `current_version` is available.
     ///
-    /// Returns `Ok(Some(ReleaseInfo))` only when the latest published (non-draft)
-    /// release has a strictly greater semver than `current_version` and carries
-    /// a downloadable asset for this platform. Returns `Ok(None)` when the
-    /// current version is up to date, when the release is a draft, or when there
-    /// is no suitable asset.
+    /// Returns `Ok(Some(ReleaseInfo))` only when the latest published release
+    /// has a strictly greater semver than `current_version` and carries a
+    /// downloadable asset for this platform. Returns `Ok(None)` when the
+    /// current version is up to date, when the release is a draft or a
+    /// pre-release, or when there is no suitable asset.
+    ///
+    /// Draft and pre-release builds are skipped by default so an unfinished or
+    /// pre-release build is never offered as a stable update. The
+    /// `releases/latest` endpoint already excludes both, but `fetch_latest` is
+    /// a thin wrapper a future caller could repoint at `/releases` or a tag, so
+    /// the guard is enforced here regardless of which release is returned.
     pub fn check_for_update(&self, current_version: &str) -> UpdaterResult<Option<ReleaseInfo>> {
         let current = parse_version(current_version)?;
         let release = self.fetch_latest()?;
-        if release.draft {
+        if release.draft || release.prerelease {
             return Ok(None);
         }
         let remote = parse_version(&release.tag_name)?;
@@ -131,16 +157,21 @@ impl<T: HttpTransport> GithubUpdater<T> {
     ///
     /// On Windows this launches the installer (the equivalent of a
     /// `ShellExecute`/`CreateProcess` on the `.exe`/`.msi`) detached from the
-    /// current process and then signals the app to exit so the installer can
-    /// replace the running binary and relaunch it. The default MSI/NSIS
-    /// installers produced by the release workflow handle the relaunch.
+    /// current process and returns [`ApplyOutcome::ExitForInstaller`]. The
+    /// caller MUST then exit the app (a running `.exe` cannot be overwritten by
+    /// its own installer), which lets the installer replace the binary and
+    /// relaunch it. `apply_update` cannot exit the process itself because it
+    /// holds no handle on the UI event loop; the desktop accept handler turns
+    /// this outcome into a `slint::quit_event_loop()`.
     ///
     /// On non-Windows hosts there is no native installer to run in this
     /// scaffold, so this is a documented portable stub: it verifies the
-    /// downloaded file exists and returns `Ok(())` without spawning anything.
-    /// The real Linux/macOS implementation will unpack the archive or run the
-    /// platform package manager here.
-    pub fn apply_update(&self, installer_path: &Path) -> UpdaterResult<()> {
+    /// downloaded file exists and returns
+    /// [`ApplyOutcome::DownloadedApplyManually`] without spawning anything or
+    /// claiming the update was applied. The real Linux/macOS implementation
+    /// will unpack the archive or run the platform package manager here and
+    /// then return [`ApplyOutcome::ExitForInstaller`].
+    pub fn apply_update(&self, installer_path: &Path) -> UpdaterResult<ApplyOutcome> {
         if !installer_path.exists() {
             return Err(UpdaterError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -150,19 +181,20 @@ impl<T: HttpTransport> GithubUpdater<T> {
         #[cfg(windows)]
         {
             // Launch the installer detached; it will replace this binary and
-            // relaunch the app. We then exit so the file is not locked.
+            // relaunch the app. The caller must now exit so the file is not
+            // locked, which we signal with ExitForInstaller.
             std::process::Command::new(installer_path).spawn()?;
-            // The caller is expected to tear down the UI; we signal intent by
-            // returning Ok. Scheduling the actual process exit is left to the
-            // application event loop so it can flush state first.
+            Ok(ApplyOutcome::ExitForInstaller)
         }
         #[cfg(not(windows))]
         {
             // Portable stub: a real Unix build would, for example, run the
-            // AppImage/`.deb`/`.dmg` installer or swap the binary in place.
+            // AppImage/`.deb`/`.dmg` installer or swap the binary in place and
+            // then return ExitForInstaller. Until then we are explicit that the
+            // user must apply the download manually rather than report success.
             let _ = installer_path;
+            Ok(ApplyOutcome::DownloadedApplyManually)
         }
-        Ok(())
     }
 }
 
@@ -194,7 +226,11 @@ impl<T: HttpTransport> Updater for GithubUpdater<T> {
     }
 
     fn apply(&self, downloaded_path: &str) -> CoreResult<()> {
+        // The core trait has no richer return type; callers that need to know
+        // whether a process exit is required use `apply_update` directly (the
+        // desktop UI does). Here we just surface any error.
         self.apply_update(Path::new(downloaded_path))
+            .map(|_| ())
             .map_err(|e| CoreError::Other(e.to_string()))
     }
 }
@@ -281,6 +317,30 @@ mod tests {
     }
 
     #[test]
+    fn prerelease_is_ignored() {
+        // A newer tag that is flagged as a pre-release must not be offered as a
+        // stable update, mirroring the draft handling.
+        let json = r#"{
+            "tag_name": "v9.9.9",
+            "body": "beta notes",
+            "draft": false,
+            "prerelease": true,
+            "assets": [
+                {
+                    "name": "FluxBridge-Setup-v9.9.9.exe",
+                    "browser_download_url": "https://example.com/dl/FluxBridge-Setup.exe"
+                }
+            ]
+        }"#
+        .to_string();
+        let updater = updater_for(json);
+        assert!(
+            updater.check_for_update("1.0.0").unwrap().is_none(),
+            "a newer pre-release must not be offered as a stable update"
+        );
+    }
+
+    #[test]
     fn release_without_assets_returns_none() {
         let json = r#"{"tag_name":"v9.9.9","body":"notes","draft":false,"assets":[]}"#.to_string();
         let updater = updater_for(json);
@@ -329,6 +389,22 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
         let err = updater.apply_update(&missing).unwrap_err();
         assert!(matches!(err, UpdaterError::Io(_)));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn apply_update_non_windows_reports_manual() {
+        // On the headless host apply is a portable stub: it must report that
+        // the user has to apply the download manually rather than claim the
+        // update was applied.
+        let updater = updater_for(sample_release_json("v1.5.0"));
+        let dir = std::env::temp_dir().join("fluxbridge-apply-manual-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("asset.bin");
+        std::fs::write(&file, b"payload").unwrap();
+        let outcome = updater.apply_update(&file).unwrap();
+        assert_eq!(outcome, ApplyOutcome::DownloadedApplyManually);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

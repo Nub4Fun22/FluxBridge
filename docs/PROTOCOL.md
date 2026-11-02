@@ -5,7 +5,11 @@ This document specifies the binary packet format implemented in
 framing is used over the ADB socket, TCP/Wi-Fi and any future iOS bridge.
 
 All multi-byte integers are **big-endian** (network order). Strings are encoded
-as a big-endian `u16` byte-length followed by that many UTF-8 bytes.
+as a big-endian `u16` byte-length followed by that many UTF-8 bytes. Because the
+length prefix is a `u16`, a single string field (for example a `FileMeta` name
+or mime) is limited to 65535 bytes; encoding a longer string fails with
+`PayloadTooLarge`. This is a protocol-level bound, not just an implementation
+detail.
 
 ## Packet framing
 
@@ -89,6 +93,11 @@ buffer. It fails with a `ProtocolError`:
 | 6      | 2    | pressure   | `u16` | normalized 0..=65535 |
 
 ### FileMeta (type `0x31`), variable length
+
+The offsets below follow the **encode order** in `FileMeta::encode_payload`
+(`file_id`, then `size`, then `name`, then `mime`), which is the order on the
+wire. This differs from the Rust struct's field-declaration order; the table
+tracks the encoder, so keep the two in sync if the encoder is ever reordered.
 
 | Offset | Size | Field   | Type   | Meaning |
 |-------:|-----:|---------|--------|---------|

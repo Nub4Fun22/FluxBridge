@@ -19,6 +19,12 @@ component UpdateDialog inherits Rectangle {
     in property <float> progress;
     // Whether a download is currently in flight (disables the accept button).
     in property <bool> downloading: false;
+    // A user-facing status or error line (empty when there is nothing to show).
+    // Carries apply results ("downloaded, apply manually") and failure text so
+    // the dialog never silently hides a failed or no-op update.
+    in property <string> status;
+    // Whether the status line should be styled as an error.
+    in property <bool> status-is-error: false;
 
     // User accepted: "Actualizeaza acum" (Update now).
     callback accept();
@@ -52,6 +58,14 @@ component UpdateDialog inherits Rectangle {
 
         ProgressIndicator {
             progress: root.progress / 100;
+        }
+
+        // Status / error line. Shown only when there is something to report so
+        // apply results and failures are visible instead of silently hiding.
+        if root.status != "": Text {
+            text: root.status;
+            wrap: word-wrap;
+            color: root.status-is-error ? #f28b82 : #81c995;
         }
 
         HorizontalBox {
@@ -90,6 +104,8 @@ export component MainWindow inherits Window {
     in property <string> update-notes;
     in property <float> update-progress;
     in property <bool> update-downloading: false;
+    in property <string> update-status;
+    in property <bool> update-status-is-error: false;
 
     // Re-exported dialog callbacks so main.rs / updater_ui.rs can connect them.
     callback update-accept();
@@ -128,6 +144,8 @@ export component MainWindow inherits Window {
         release-notes: root.update-notes;
         progress: root.update-progress;
         downloading: root.update-downloading;
+        status: root.update-status;
+        status-is-error: root.update-status-is-error;
         accept => {
             root.update-accept();
         }
