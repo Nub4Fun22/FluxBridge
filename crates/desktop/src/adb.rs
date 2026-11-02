@@ -261,6 +261,21 @@ pub fn mdns_check_args() -> Vec<String> {
     vec!["mdns".into(), "check".into()]
 }
 
+/// Build `adb start-server` to ensure the adb daemon is running. This is cheap
+/// and non-disruptive (a no-op when the daemon is already up), so it is safe to
+/// run best-effort before connecting. It takes no `-s` selector.
+pub fn start_server_args() -> Vec<String> {
+    vec!["start-server".into()]
+}
+
+/// Build `adb kill-server` to stop the adb daemon. This is disruptive to other
+/// adb users on the machine, so it must only be issued as a one-time recovery
+/// step after a connection-class failure, never unconditionally. It takes no
+/// `-s` selector.
+pub fn kill_server_args() -> Vec<String> {
+    vec!["kill-server".into()]
+}
+
 /// The mDNS service type of a discovered wireless-debugging endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MdnsServiceKind {
@@ -1107,6 +1122,12 @@ mod tests {
     fn mdns_services_and_check_args_exact() {
         assert_eq!(mdns_services_args(), vec!["mdns", "services"]);
         assert_eq!(mdns_check_args(), vec!["mdns", "check"]);
+    }
+
+    #[test]
+    fn start_and_kill_server_args_exact() {
+        assert_eq!(start_server_args(), vec!["start-server"]);
+        assert_eq!(kill_server_args(), vec!["kill-server"]);
     }
 
     #[test]

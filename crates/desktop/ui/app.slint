@@ -427,6 +427,11 @@ export component MainWindow inherits Window {
     callback wireless-connect-device(string);
     // Start-menu callbacks, wired in src/ui.rs.
     callback start();
+    // Start mirroring explicitly over USB. Wired in src/ui.rs to the shared
+    // pipeline closure with Transport::Usb. Serves as both a feature and a
+    // diagnostic: if USB mirrors but Wi-Fi does not, the problem is on the
+    // network/pairing side rather than the mirroring pipeline.
+    callback connect-usb();
     callback quit();
     callback check-for-updates();
     // End the current mirroring session and return to the Start menu WITHOUT
@@ -537,7 +542,8 @@ export component MainWindow inherits Window {
     }
 
     // Landing / start menu, centered over the window on launch. Hidden once the
-    // user clicks Start. Buttons: Start, Check for updates, Help, Quit.
+    // user clicks Start. Buttons: Start, Connect via USB, Connect wirelessly,
+    // Check for updates, Help, Quit.
     if root.menu-visible: Rectangle {
         // Dim the backdrop so the menu reads as a modal landing panel.
         background: #000000cc;
@@ -577,6 +583,12 @@ export component MainWindow inherits Window {
                     primary: true;
                     clicked => {
                         root.start();
+                    }
+                }
+                Button {
+                    text: "Connect via USB";
+                    clicked => {
+                        root.connect-usb();
                     }
                 }
                 Button {

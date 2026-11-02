@@ -540,6 +540,66 @@ fn is_retryable_connect_error(e: &std::io::Error) -> bool {
     )
 }
 
+/// Whether an [`adb::AdbError`] from a `connect`/accept step looks like a
+/// connection-class failure that a one-time adb daemon restart might clear,
+/// rather than a hard configuration error.
+///
+/// This is the decision half of the FAILURE-path daemon hygiene: a stale or
+/// wedged adb daemon can make `adb connect` fail or the reverse-mode accept
+/// time out, and bouncing the daemon once can recover it. We treat as
+/// connection-class:
+///
+/// * [`adb::AdbError::Io`] whose underlying kind is one of the transient
+///   connection kinds (refused/reset/aborted/timed-out), which also covers the
+///   reverse-mode accept timeout (a `TimedOut` I/O error); and
+/// * [`adb::AdbError::Command`] from adb exiting non-zero, which is how a failed
+///   `adb connect` surfaces (adb prints the failure to stderr and exits 1).
+///
+/// A [`adb::AdbError::NotFound`] is explicitly NOT connection-class: restarting
+/// the daemon cannot make a missing adb binary appear, so it is left to the
+/// existing "install platform-tools" guidance.
+fn is_connection_class_error(e: &adb::AdbError) -> bool {
+    match e {
+        adb::AdbError::Io(io) => is_retryable_connect_error(io),
+        adb::AdbError::Command { .. } => true,
+        adb::AdbError::NotFound { .. } => false,
+    }
+}
+
+/// One-shot gate for the failure-path adb daemon recovery.
+///
+/// A wedged adb daemon is bounced AT MOST ONCE per pipeline run: the first time
+/// a connection-class failure is seen, [`DaemonRecovery::allow`] returns `true`
+/// and permanently flips the gate so every subsequent call returns `false`.
+/// This guarantees repeated failures never loop on kill-server/start-server and
+/// that a healthy run (no connection-class failure) never bounces the daemon at
+/// all. It is a pure, headless-testable decision helper; the actual
+/// kill-server/start-server spawning is done by the caller and only exercised
+/// on a real device.
+#[derive(Debug, Default)]
+struct DaemonRecovery {
+    used: bool,
+}
+
+impl DaemonRecovery {
+    /// A fresh gate that has not yet spent its single recovery attempt.
+    fn new() -> Self {
+        DaemonRecovery { used: false }
+    }
+
+    /// Decide whether a recovery (kill-server + start-server + one retry) is
+    /// permitted for `error`. Returns `true` only when `error` is
+    /// connection-class AND the one-shot attempt has not been spent yet; on a
+    /// `true` it marks the attempt spent so it can never return `true` twice.
+    fn allow(&mut self, error: &adb::AdbError) -> bool {
+        if self.used || !is_connection_class_error(error) {
+            return false;
+        }
+        self.used = true;
+        true
+    }
+}
+
 /// Connect the forward-mode video socket with a bounded retry/backoff, mirroring
 /// scrcpy's own forward-mode connect loop. Retries a retryable connect error
 /// (see [`is_retryable_connect_error`]) up to the dummy-byte attempt bound with
@@ -758,6 +818,19 @@ pub fn run_pipeline_full(
     );
     let mut cmd = AdbCommand::with_path(adb_path, selector.clone());
 
+    // Best-effort adb daemon hygiene BEFORE the first connect: ensure the
+    // daemon is up so a not-yet-running adb starts cleanly. `adb start-server`
+    // is a no-op when the daemon is already running, so this is cheap and does
+    // NOT disrupt other adb users (unlike kill-server, which we only run on the
+    // failure path below). Its own errors are ignored: if the daemon cannot be
+    // started here, the subsequent connect/push will surface the real problem.
+    let _ = cmd.run(&adb::start_server_args());
+
+    // The one-shot daemon recovery gate for the failure path. A connection-class
+    // failure may trigger a single kill-server + start-server + retry; see
+    // [`DaemonRecovery`]. A healthy run never spends it.
+    let mut daemon_recovery = DaemonRecovery::new();
+
     // 2. Wi-Fi connect, then resolve the REAL adb-registered serial.
     //
     //    `config.selector()` for Wi-Fi is the raw `ip:connect_port` mDNS
@@ -773,9 +846,26 @@ pub fn run_pipeline_full(
     }
     let selector = if let Transport::WiFi { ip, port } = &config.transport {
         if let Err(e) = cmd.run(&adb::connect_args(ip, *port)) {
-            // The connect itself failed, so nothing is registered to tear down.
-            report(status, PipelineStatus::Error(e.to_string()));
-            return Err(e);
+            // The connect failed. If it looks connection-class (adb erroring),
+            // bounce the adb daemon ONCE and retry the connect exactly once; a
+            // stale/wedged daemon is a common cause of a failed `adb connect`.
+            // The kill/restart is gated so repeated failures never loop and a
+            // healthy run never kills the daemon. All hygiene calls are
+            // best-effort (their own errors ignored); the ORIGINAL connect error
+            // is surfaced if recovery still fails.
+            let recovered = if daemon_recovery.allow(&e) {
+                let _ = cmd.run(&adb::kill_server_args());
+                let _ = cmd.run(&adb::start_server_args());
+                cmd.run(&adb::connect_args(ip, *port)).is_ok()
+            } else {
+                false
+            };
+            if !recovered {
+                // The connect itself failed, so nothing is registered to tear
+                // down.
+                report(status, PipelineStatus::Error(e.to_string()));
+                return Err(e);
+            }
         }
         report(status, PipelineStatus::Connected(format!("{ip}:{port}")));
 
@@ -1760,6 +1850,83 @@ mod tests {
             ErrorKind::PermissionDenied,
             "x"
         )));
+    }
+
+    // --- Failure-path adb daemon hygiene (FEAT-003) -----------------------
+
+    /// A failed `adb connect` surfaces as `AdbError::Command` (adb exits
+    /// non-zero), which is connection-class so a one-time daemon bounce is
+    /// permitted. The reverse-mode accept timeout surfaces as an `AdbError::Io`
+    /// with a `TimedOut` kind, which is also connection-class. A missing adb
+    /// (`NotFound`) is NOT connection-class: restarting the daemon cannot make
+    /// the binary appear, so recovery must be declined.
+    #[test]
+    fn connection_class_error_classification() {
+        use std::io::{Error, ErrorKind};
+
+        // A failed `adb connect` (non-zero exit).
+        assert!(is_connection_class_error(&adb::AdbError::Command {
+            args: vec!["connect".into(), "192.168.1.42:5555".into()],
+            code: Some(1),
+            stderr: "failed to connect".into(),
+        }));
+
+        // The reverse-mode accept timing out.
+        assert!(is_connection_class_error(&adb::AdbError::Io(Error::new(
+            ErrorKind::TimedOut,
+            "reverse-mode accept retries exhausted"
+        ))));
+        // A connection-refused I/O error is likewise connection-class.
+        assert!(is_connection_class_error(&adb::AdbError::Io(Error::new(
+            ErrorKind::ConnectionRefused,
+            "x"
+        ))));
+
+        // A non-connection I/O error is not.
+        assert!(!is_connection_class_error(&adb::AdbError::Io(Error::new(
+            ErrorKind::PermissionDenied,
+            "x"
+        ))));
+        // A missing adb binary is not fixable by a daemon restart.
+        assert!(!is_connection_class_error(&adb::AdbError::NotFound {
+            searched: vec!["PATH".into()],
+        }));
+    }
+
+    /// The daemon recovery gate is strictly one-shot and only ever fires on a
+    /// connection-class failure: the FIRST connection-class error spends the
+    /// single attempt (returns `true`), and every subsequent call (even another
+    /// connection-class error) returns `false`, so the kill-server/start-server
+    /// recovery can never loop. A non-connection-class error never spends the
+    /// attempt, so a later connection-class error can still use it once.
+    #[test]
+    fn daemon_recovery_is_one_shot_and_only_on_connection_failure() {
+        use std::io::{Error, ErrorKind};
+        let conn = || adb::AdbError::Command {
+            args: vec!["connect".into()],
+            code: Some(1),
+            stderr: "boom".into(),
+        };
+
+        // First connection-class failure: recovery allowed, attempt spent.
+        let mut gate = DaemonRecovery::new();
+        assert!(gate.allow(&conn()), "first connection failure may recover");
+        assert!(
+            !gate.allow(&conn()),
+            "a second connection failure must NOT recover (one-shot)"
+        );
+
+        // A non-connection-class error never spends the one-shot attempt, so a
+        // genuine connection failure afterwards can still recover exactly once.
+        let mut gate = DaemonRecovery::new();
+        let not_conn = adb::AdbError::Io(Error::new(ErrorKind::PermissionDenied, "x"));
+        assert!(!gate.allow(&not_conn), "non-connection errors never recover");
+        assert!(!gate.allow(&not_conn));
+        assert!(
+            gate.allow(&conn()),
+            "the one-shot attempt survives non-connection errors"
+        );
+        assert!(!gate.allow(&conn()), "and is spent after the first use");
     }
 
     // --- Reverse tunneling (the shipped default) --------------------------
