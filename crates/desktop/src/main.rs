@@ -38,6 +38,7 @@ mod pipeline;
 mod provision;
 mod scrcpy;
 mod updater_ui;
+mod wireless_ui;
 
 #[cfg(feature = "gui")]
 mod ui;

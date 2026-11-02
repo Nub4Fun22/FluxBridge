@@ -59,7 +59,9 @@ Windows product/installer name.
 - Floating tray "pill" widget (2FA code extraction, media controls, battery/signal).
 - Virtual secondary display / app sandboxing on Android via `DisplayManager`.
 - Toggleable developer side panel (filtered Logcat, UI inspector, network monitor).
-- Wireless auto-pairing via mDNS and global keyboard shortcuts.
+- Wireless discovery and one-time-code pairing via mDNS (Android 11+ Wireless
+  debugging), with silent auto-reconnect to a remembered device on later
+  launches. Global keyboard shortcuts are planned.
 - Intelligent in-app updater backed by the GitHub Releases API. FluxBridge
   checks for updates automatically at startup, and the Start menu's "Check for
   updates" button re-runs the check on demand (it reports when you are already
@@ -72,8 +74,19 @@ transports:
 
 - **USB:** plug the phone in, `adb forward tcp:<port> localabstract:scrcpy`
   tunnels a local socket to the device.
-- **Wi-Fi:** `adb tcpip 5555` once over USB, then `adb connect <ip:port>` and the
-  same forward. mDNS auto-pairing is planned (Phase 2).
+- **Wi-Fi (automatic discovery + one-time pairing):** FluxBridge uses the
+  Android 11+ Wireless debugging flow, so you never type an IP by hand. Enable
+  Wireless debugging on the phone (same Wi-Fi as the PC), open "Connect
+  wirelessly" and click Scan. FluxBridge discovers the phone over mDNS by
+  driving `adb mdns services`. The first time, tap "Pair device with pairing
+  code" on the phone and type the shown 6-digit code; FluxBridge runs `adb pair`
+  then `adb connect` and remembers the device, so later launches reconnect
+  automatically. The one-time 6-digit code is shown only on the phone, so that
+  very first pairing is not zero-touch; everything after it is. adb itself is
+  auto-provisioned: if it is not installed, FluxBridge downloads Google's
+  official platform-tools on first use and keeps a private copy (no PATH edits,
+  no admin rights), falling back to the manual "install adb" guidance only when
+  that download is blocked offline.
 
 The device-side server is the upstream, MIT-licensed **scrcpy server** jar,
 pushed to `/data/local/tmp` and launched with `app_process` (no app install).
