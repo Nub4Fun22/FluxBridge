@@ -183,7 +183,16 @@ impl<T: HttpTransport> GithubUpdater<T> {
             // Launch the installer detached; it will replace this binary and
             // relaunch the app. The caller must now exit so the file is not
             // locked, which we signal with ExitForInstaller.
-            std::process::Command::new(installer_path).spawn()?;
+            //
+            // CREATE_NO_WINDOW (0x08000000) suppresses the console window a
+            // spawned child would otherwise flash on screen. The installer is a
+            // GUI Inno Setup wizard, so this only hides a stray console, not the
+            // installer's own window.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new(installer_path)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()?;
             Ok(ApplyOutcome::ExitForInstaller)
         }
         #[cfg(not(windows))]
