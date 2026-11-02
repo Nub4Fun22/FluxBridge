@@ -1,0 +1,138 @@
+// FluxBridge desktop UI.
+//
+// Minimal but valid Slint markup compiled by build.rs (behind the `gui`
+// feature). It defines the main window with a connection status label and a
+// video surface placeholder, plus an UpdateDialog component that surfaces the
+// in-app updater: release notes, a download progress bar bound to a property,
+// and exactly two buttons labelled "Actualizeaza acum" and "Mai tarziu / Refuza".
+
+import { Button, VerticalBox, HorizontalBox, ProgressIndicator, ScrollView } from "std-widgets.slint";
+
+// Non-intrusive update notification dialog. Shown only when an update is
+// available. The two action callbacks are wired in src/updater_ui.rs.
+component UpdateDialog inherits Rectangle {
+    // Release version tag, for example "v1.2.0".
+    in property <string> version;
+    // Markdown release notes to display to the user.
+    in property <string> release-notes;
+    // Download progress in 0..=100, bound to the progress bar.
+    in property <float> progress;
+    // Whether a download is currently in flight (disables the accept button).
+    in property <bool> downloading: false;
+
+    // User accepted: "Actualizeaza acum" (Update now).
+    callback accept();
+    // User declined: "Mai tarziu / Refuza" (Later / Decline).
+    callback dismiss();
+
+    background: #202124;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #3c4043;
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: "Actualizare disponibila: " + root.version;
+            font-size: 16px;
+            font-weight: 700;
+            color: white;
+        }
+
+        ScrollView {
+            height: 120px;
+            Text {
+                text: root.release-notes;
+                wrap: word-wrap;
+                color: #e8eaed;
+            }
+        }
+
+        ProgressIndicator {
+            progress: root.progress / 100;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            Button {
+                text: "Actualizeaza acum";
+                primary: true;
+                enabled: !root.downloading;
+                clicked => {
+                    root.accept();
+                }
+            }
+            Button {
+                text: "Mai tarziu / Refuza";
+                enabled: !root.downloading;
+                clicked => {
+                    root.dismiss();
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "FluxBridge";
+    preferred-width: 960px;
+    preferred-height: 600px;
+    background: #17181a;
+
+    // Connection status text, for example "Connected to 127.0.0.1:27183".
+    in property <string> connection-status: "Disconnected";
+    // Whether the update dialog is visible.
+    in property <bool> update-available: false;
+    // Properties forwarded to the UpdateDialog.
+    in property <string> update-version;
+    in property <string> update-notes;
+    in property <float> update-progress;
+    in property <bool> update-downloading: false;
+
+    // Re-exported dialog callbacks so main.rs / updater_ui.rs can connect them.
+    callback update-accept();
+    callback update-dismiss();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        Text {
+            text: root.connection-status;
+            color: #9aa0a6;
+            font-size: 13px;
+        }
+
+        // Video surface placeholder. The decode loop will push DecodedFrame
+        // buffers here (as an Image) once hardware decoding is wired up.
+        Rectangle {
+            background: black;
+            border-radius: 4px;
+            vertical-stretch: 1;
+            Text {
+                text: "Video surface";
+                color: #5f6368;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    if root.update-available: UpdateDialog {
+        x: parent.width - self.width - 16px;
+        y: parent.height - self.height - 16px;
+        width: 360px;
+        version: root.update-version;
+        release-notes: root.update-notes;
+        progress: root.update-progress;
+        downloading: root.update-downloading;
+        accept => {
+            root.update-accept();
+        }
+        dismiss => {
+            root.update-dismiss();
+        }
+    }
+}

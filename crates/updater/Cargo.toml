@@ -1,0 +1,20 @@
+[package]
+name = "fluxbridge-updater"
+description = "GitHub Releases in-app updater for FluxBridge: check, download with progress, apply."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fluxbridge-core = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+semver = { workspace = true }
+
+[features]
+default = []

@@ -1,0 +1,17 @@
+[package]
+name = "fluxbridge-core"
+description = "OS-agnostic core for FluxBridge: binary wire protocol and decoupling trait abstractions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+bitflags = { workspace = true }
+
+[features]
+default = []

@@ -1,0 +1,88 @@
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+/target/
+**/target/
+# Cargo.lock: this workspace produces binaries, so Cargo.lock IS committed at
+# the root. Do not ignore it. (Library-only crates would ignore it instead.)
+*.rs.bk
+# Rust incremental / profiling artifacts
+**/*.pdb
+*.profraw
+
+# ---------------------------------------------------------------------------
+# Node / JavaScript (tooling, docs site, any future web assets)
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+dist/
+.cache/
+
+# ---------------------------------------------------------------------------
+# C / C++ build artifacts (native helper libs, FFmpeg glue)
+# ---------------------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# ---------------------------------------------------------------------------
+# Android (capture server)
+# ---------------------------------------------------------------------------
+.gradle/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+android-server/build/
+android-server/.cxx/
+captures/
+.externalNativeBuild/
+
+# ---------------------------------------------------------------------------
+# Windows installer output (Inno Setup)
+# ---------------------------------------------------------------------------
+installer/Output/
+*.iss.bak
+
+# ---------------------------------------------------------------------------
+# IDE / editor files
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+
+# ---------------------------------------------------------------------------
+# OS cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ---------------------------------------------------------------------------
+# Logs / local env
+# ---------------------------------------------------------------------------
+*.log
+.env
+.env.local

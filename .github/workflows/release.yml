@@ -1,0 +1,100 @@
+# FluxBridge release pipeline.
+#
+# Triggered by pushing a SemVer tag (vX.Y.Z). It builds the optimized Windows
+# GUI binary, packages it as both a portable .zip and an Inno Setup installer
+# (.exe), and publishes a GitHub Release with both assets attached. The in-app
+# updater (crates/updater) polls the GitHub Releases API and prefers the `.exe`
+# asset, so the Setup installer it downloads is the one this workflow uploads.
+#
+# This job runs on GitHub's hosted windows-latest runner, NOT in the Linux dev
+# sandbox. It is validated here only as YAML.
+
+name: release
+
+# Run on version tags only. Both globs match SemVer tags like v1.2.0; the
+# second is kept explicit per the plan so three-part tags are clearly covered.
+on:
+  push:
+    tags:
+      - "v*"
+      - "v*.*.*"
+
+# The release step needs write access to create the GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      # 1. Check out the tagged commit.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Install a stable Rust toolchain.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # 3. Cache the cargo registry and target dir to speed up repeat builds.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      # 4. Build the optimized production binary.
+      #    LTO and stripped debug symbols come from [profile.release] in the
+      #    workspace Cargo.toml (lto=true, codegen-units=1, strip=true,
+      #    panic="abort"), so this is just a plain --release build. The desktop
+      #    GUI lives behind the OFF-by-default `gui` cargo feature, so the
+      #    release build MUST enable it to produce the actual windowed client.
+      - name: Build release binary (GUI)
+        run: cargo build --release --features gui --bin fluxbridge-desktop
+
+      # 5. Package the portable .zip containing the built .exe.
+      #    github.ref_name is the tag that triggered the run (for example v1.2.0).
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+            -Path target\release\fluxbridge-desktop.exe `
+            -DestinationPath "dist\FluxBridge-${{ github.ref_name }}-portable.zip" `
+            -Force
+
+      # 6. Install the Inno Setup compiler (ISCC) via Chocolatey.
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress --yes
+
+      # 7. Compile installer/fluxbridge.iss into a Setup .exe.
+      #    The version is passed through /DAppVersion so the installer's
+      #    AppVersion and output filename track the tag. The ref_name keeps its
+      #    leading 'v' here only for the human-facing wizard; the output file is
+      #    named FluxBridge-Setup-<version>.exe by the script's OutputBaseFilename.
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=${{ github.ref_name }}" `
+            installer\fluxbridge.iss
+
+      # 8. Create the GitHub Release and attach both artifacts.
+      #    softprops/action-gh-release reads the tag from github.ref automatically.
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FluxBridge ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/FluxBridge-${{ github.ref_name }}-portable.zip
+            dist/FluxBridge-Setup-${{ github.ref_name }}.exe

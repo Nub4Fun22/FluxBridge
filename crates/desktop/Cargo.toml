@@ -1,0 +1,38 @@
+[package]
+name = "fluxbridge-desktop"
+description = "FluxBridge desktop client: Slint GUI, connection skeleton, stream decode loop, in-app updater wiring."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fluxbridge-desktop"
+path = "src/main.rs"
+
+[dependencies]
+fluxbridge-core = { workspace = true }
+fluxbridge-updater = { workspace = true }
+# Slint is optional and OFF by default. The headless Linux CI host has no
+# display server and no guarantee of the system GUI libraries Slint's backends
+# need, so the default build compiles all the pure-Rust logic (connection,
+# decode loop, updater wiring) and skips the GUI. Build with `--features gui`
+# on a developer workstation to compile the actual Slint UI. See README.md.
+slint = { version = "1", optional = true, default-features = false, features = [
+    "compat-1-2",
+    "std",
+    "backend-winit",
+    "renderer-software",
+] }
+
+[build-dependencies]
+# Only needed when the `gui` feature compiles ui/app.slint.
+slint-build = { version = "1", optional = true }
+
+[features]
+default = []
+# Compile and wire the Slint UI. Requires a platform with the GUI libraries
+# Slint's winit backend needs.
+gui = ["dep:slint", "dep:slint-build"]

@@ -1,0 +1,97 @@
+# FluxBridge architecture blueprint
+
+FluxBridge separates a portable application core from the operating-system and
+vendor integrations it drives. The core owns the wire protocol and the
+orchestration logic; everything that touches a platform API or a vendor library
+sits behind a trait defined in `fluxbridge-core` and is implemented by a
+swappable backend. This is what lets the same codebase target Windows first and
+then port to Linux (Wayland/X11) without rewriting the application logic, and
+what lets the whole workspace build and test on a headless Linux CI host using
+stub backends.
+
+## Component diagram
+
+```mermaid
+flowchart LR
+    subgraph Device["Connected device (Android / iOS)"]
+        CAP["Capture server\n(MediaCodec / AirPlay)"]
+        INP["Input injector\n(InputManager / WDA)"]
+    end
+
+    subgraph Host["FluxBridge desktop host"]
+        subgraph Core["fluxbridge-core (OS-agnostic)"]
+            PROTO["Protocol Bridge\n(packet codec)"]
+            ORCH["Session orchestration"]
+            TRAITS["Trait abstractions:\nVideoCapture, VideoDecoder,\nInputSink, DragDropBridge,\nClipboardSync, Updater"]
+        end
+
+        subgraph Backends["Platform backends (#[cfg]-gated)"]
+            DEC["Decoder\nFFmpeg DXVA2/D3D11VA (Win)\nFFmpeg VA-API/VDPAU (Linux)"]
+            IM["Input Mapper\nhost events -> device events"]
+            DND["Reverse Drag-and-Drop\nOLE (Win) / XDnD-Wayland (Linux)"]
+            CLIP["Clipboard backend"]
+            UPD["Updater\nGitHub Releases"]
+        end
+
+        UI["Slint UI\n(fluxbridge-desktop)"]
+    end
+
+    CAP -- encoded frames --> PROTO
+    PROTO --> DEC --> UI
+    UI -- input --> IM --> PROTO -- control --> INP
+    PROTO <--> CLIP
+    DND <--> PROTO
+    UPD --> UI
+    PROTO --- ORCH --- TRAITS
+    TRAITS -. implemented by .-> Backends
+```
+
+## Modules
+
+### Capture
+Acquires an encoded video stream from the device. On Android this is the
+`app_process` capture server using `SurfaceControl` + `MediaCodec` to produce
+H.264/H.265 delivered over an ADB socket; on iOS it is an AirPlay mirroring
+receiver or an RTP H.264 stream. In the core this is the `VideoCapture` trait,
+which yields `EncodedFrame` values and never exposes transport details.
+
+### Decoder
+Turns encoded frames into displayable pixels. Production backends use FFmpeg
+with hardware acceleration: DXVA2 / D3D11VA on Windows, VA-API / VDPAU on Linux.
+Modeled by the `VideoDecoder` trait so no FFmpeg symbols leak into the portable
+core; the headless stubs return `NotImplemented`.
+
+### Input Mapper
+Translates host input (mouse, keyboard, touch/pen) into the protocol's
+`MouseEvent`, `KeyEvent` and `TouchEvent` packets, handling coordinate scaling
+between the host window and the device resolution. The device-facing delivery is
+the `InputSink` trait (Android `InputManager`, iOS WebDriverAgent).
+
+### Protocol Bridge
+The heart of the core: the binary packet codec (`protocol.rs`). It frames and
+parses every packet type on every transport, so media, input, clipboard and file
+traffic share one well-defined wire format. See
+[`PROTOCOL.md`](PROTOCOL.md) for the exact layout.
+
+### Reverse Drag-and-Drop
+Coordinates bi-directional, context-aware drag-and-drop. PC to phone injects a
+file into the device's foreground app; phone to PC starts a native host drag.
+The host side is the `DragDropBridge` trait: Windows uses OLE `IDataObject` /
+`IDropSource`; Linux uses XDnD (X11) or `wl_data_device` (Wayland).
+
+### Updater
+Checks GitHub Releases on startup, offers the user "update now" or "later",
+then downloads and applies the new build. Modeled by the `Updater` trait; the
+concrete GitHub implementation lands in the `fluxbridge-updater` crate.
+
+## How the core stays decoupled
+
+- `fluxbridge-core` depends only on pure-Rust, link-free crates (`thiserror`,
+  `byteorder`, `bitflags`). It never pulls in FFmpeg, ADB, OLE or
+  libimobiledevice bindings.
+- Each OS/vendor capability is a trait. Backends live behind `#[cfg(windows)]`
+  / `#[cfg(unix)]` and are selected in `platform/mod.rs`.
+- Stub backends implement every trait with a no-op or `NotImplemented` error, so
+  the workspace compiles and the test suite runs on any host.
+- The Slint UI crate depends on the core's traits, not on concrete backends, so
+  UI and application logic are testable without a device present.

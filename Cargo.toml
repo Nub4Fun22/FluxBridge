@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/updater",
+    "crates/desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["FluxBridge contributors"]
+repository = "https://github.com/fluxbridge/fluxbridge"
+rust-version = "1.75"
+
+# Optimized profile used by the CI release build (.github/workflows/release.yml).
+# These knobs are what the user asked for: an optimized production binary with
+# LTO and stripped debug symbols. Keeping them in the manifest (rather than
+# passing ad-hoc RUSTFLAGS in CI) means `cargo build --release` is reproducible
+# everywhere and the workflow stays a thin wrapper.
+#
+#   lto           = true  -> link-time optimization across all crates for the
+#                            smallest, fastest binary (slower to compile, which
+#                            is fine for a tagged release build).
+#   codegen-units = 1     -> one codegen unit maximizes cross-function inlining
+#                            and optimization at the cost of parallelism.
+#   strip         = true  -> strip symbols/debuginfo from the final binary so the
+#                            shipped .exe is small ("strip debug symbols").
+#   panic         = "abort" -> abort instead of unwinding on panic: smaller code,
+#                            no landing pads. Safe for the shipped GUI binary. It
+#                            applies to the release profile only, so the default
+#                            `dev`/`test` profiles still unwind and the whole
+#                            workspace's `cargo test` keeps working unchanged.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace.dependencies]
+thiserror = "1"
+byteorder = "1"
+bitflags = "2"
+fluxbridge-core = { path = "crates/core", version = "0.1.0" }
+fluxbridge-updater = { path = "crates/updater", version = "0.1.0" }
+# HTTP for the updater: ureq uses rustls (pure Rust), so nothing links to the
+# system OpenSSL, which is not guaranteed on the headless Linux host.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
