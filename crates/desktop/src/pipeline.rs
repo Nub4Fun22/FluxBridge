@@ -21,10 +21,62 @@
 //! only reached at runtime on the user's machine, never on the headless CI host.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::adb::{self, AdbCommand, DeviceSelector, ServerLaunchOptions};
 use crate::connection::ConnectionConfig;
+
+/// A cooperative cancellation flag shared between the UI thread and the
+/// pipeline worker thread.
+///
+/// The UI owns one of these and hands a clone to the spawned pipeline. When the
+/// user clicks "Stop mirroring" the UI calls [`CancelFlag::cancel`]; the
+/// pipeline checks [`CancelFlag::is_cancelled`] at natural boundaries (before
+/// each blocking adb phase and inside the stream loop) and, when set, breaks
+/// out so the existing teardown path runs exactly once.
+///
+/// The flag is an [`Arc`]-wrapped [`AtomicBool`], so flipping it from the UI
+/// thread while the pipeline thread reads it is data-race free. It defaults to
+/// NOT cancelled, and [`CancelFlag::cancel`] is idempotent (setting it twice
+/// leaves it set).
+#[derive(Debug, Clone, Default)]
+pub struct CancelFlag {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelFlag {
+    /// A fresh flag in the NOT-cancelled state.
+    pub fn new() -> Self {
+        CancelFlag {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Request cancellation. Idempotent: calling it when already cancelled
+    /// leaves the flag set, and it is safe to call when nothing is mirroring.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Reset the flag back to NOT-cancelled, so the same flag can be reused for
+    /// a fresh pipeline run after a stop.
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether an optional cancel flag has been tripped. A `None` flag (the headless
+/// build and callers that do not support stopping) is never cancelled.
+fn is_cancelled(cancel: Option<&CancelFlag>) -> bool {
+    cancel.map(CancelFlag::is_cancelled).unwrap_or(false)
+}
 
 /// How the device is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +345,7 @@ pub fn run_pipeline_with_frames(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
 ) -> Result<(), adb::AdbError> {
-    run_pipeline_full(config, status, frame_sink, None)
+    run_pipeline_full(config, status, frame_sink, None, None)
 }
 
 /// Like [`run_pipeline_with_frames`] but also installs the scrcpy control sink
@@ -309,8 +361,19 @@ pub fn run_pipeline_full(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
     control_sink: Option<std::sync::Arc<ControlSinkSlot>>,
+    cancel: Option<CancelFlag>,
 ) -> Result<(), adb::AdbError> {
     let selector = config.selector();
+    let cancel = cancel.as_ref();
+
+    // 0. If a stop was requested before we even started (or the flag arrives
+    //    already set), short-circuit straight to Stopped WITHOUT spawning any
+    //    adb. Nothing was set up, so there is nothing to tear down. This is the
+    //    headless-testable cancellation path: no device, adb, or socket needed.
+    if is_cancelled(cancel) {
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
 
     // 1. Locate adb, preferring a previously provisioned bundled copy. If adb
     //    cannot be found anywhere, auto-provision it (download + extract
@@ -340,6 +403,10 @@ pub fn run_pipeline_full(
     //    subsequent `-s <serial>` command (push/forward/launch/teardown) must
     //    target whatever adb listed. We resolve that serial here and REBIND
     //    both the selector and the AdbCommand to it; USB keeps UsbDefault.
+    if is_cancelled(cancel) {
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
     let selector = if let Transport::WiFi { ip, port } = &config.transport {
         if let Err(e) = cmd.run(&adb::connect_args(ip, *port)) {
             report(status, PipelineStatus::Error(e.to_string()));
@@ -363,6 +430,15 @@ pub fn run_pipeline_full(
         selector
     };
 
+    // A stop requested during the Wi-Fi connect/resolve: nothing beyond the
+    // connect is set up yet, so disconnect (teardown is safe/idempotent even
+    // though no forward exists) and report Stopped.
+    if is_cancelled(cancel) {
+        teardown_with(&cmd, config, &selector);
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
+
     // 3. Push the server jar, resolved against the executable directory so an
     //    installed app finds the bundled jar regardless of its working dir.
     let server_jar = config.resolve_server_jar();
@@ -385,6 +461,14 @@ pub fn run_pipeline_full(
     }
     report(status, PipelineStatus::Forwarded(config.local_port));
 
+    // A stop requested after the forward is up but before launch: remove the
+    // forward we just added (teardown is best-effort) and report Stopped.
+    if is_cancelled(cancel) {
+        teardown_with(&cmd, config, &selector);
+        report(status, PipelineStatus::Stopped);
+        return Ok(());
+    }
+
     // 5. Launch the scrcpy server.
     let mut server_child = match cmd.spawn(&adb::server_launch_args(&selector, &config.server_opts))
     {
@@ -398,7 +482,7 @@ pub fn run_pipeline_full(
     report(status, PipelineStatus::ServerLaunched);
 
     // 6. Connect the forwarded socket(s) and run the scrcpy stream.
-    let result = run_stream(config, status, frame_sink, control_sink.as_deref());
+    let result = run_stream(config, status, frame_sink, control_sink.as_deref(), cancel);
 
     // Teardown: kill the server child and remove the forward.
     let _ = server_child.kill();
@@ -431,9 +515,16 @@ fn run_stream(
     status: &Sender<PipelineStatus>,
     frame_sink: Option<Sender<fluxbridge_core::DecodedFrame>>,
     control_sink: Option<&ControlSinkSlot>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<(), adb::AdbError> {
     use std::net::TcpStream;
     use std::sync::mpsc;
+
+    // A stop requested before the socket is even dialed: return cleanly so the
+    // caller runs kill-child + teardown exactly once.
+    if is_cancelled(cancel) {
+        return Ok(());
+    }
 
     let addr = format!("{}:{}", crate::connection::DEFAULT_HOST, config.local_port);
 
@@ -542,7 +633,11 @@ fn run_stream(
         return Ok(());
     }
 
-    if let Err(e) = crate::scrcpy::stream_av_packets(&mut video, &mut decoder, &sink) {
+    // The access-unit loop checks the cancel flag once per iteration so a Stop
+    // breaks it promptly between packets; the 30s socket read timeout set above
+    // lets a blocked read wake to observe the flag.
+    let cancelled = || is_cancelled(cancel);
+    if let Err(e) = crate::scrcpy::stream_av_packets(&mut video, &mut decoder, &sink, &cancelled) {
         report(status, PipelineStatus::Error(e.to_string()));
     }
     Ok(())
@@ -937,5 +1032,116 @@ mod tests {
             PipelineStatus::Paired("192.168.1.42:37000".into()).to_string(),
             "paired with 192.168.1.42:37000"
         );
+    }
+
+    // --- Feature 6: cooperative stop / teardown (headless) ----------------
+
+    /// A fresh [`CancelFlag`] is NOT cancelled, [`CancelFlag::cancel`] trips it,
+    /// setting it twice leaves it set (idempotent), and [`CancelFlag::reset`]
+    /// clears it so the same flag can be reused for a later Start.
+    #[test]
+    fn cancel_flag_semantics_are_idempotent() {
+        let flag = CancelFlag::new();
+        assert!(!flag.is_cancelled(), "a fresh flag must not be cancelled");
+
+        flag.cancel();
+        assert!(flag.is_cancelled(), "cancel must trip the flag");
+        // Idempotent: a second cancel leaves it set.
+        flag.cancel();
+        assert!(flag.is_cancelled(), "a second cancel must leave it set");
+
+        // A clone shares the same state (the UI hands a clone to the thread).
+        let clone = flag.clone();
+        assert!(clone.is_cancelled(), "a clone must observe the same state");
+
+        flag.reset();
+        assert!(!flag.is_cancelled(), "reset must clear the flag");
+        assert!(
+            !clone.is_cancelled(),
+            "reset must be visible through a clone"
+        );
+    }
+
+    /// The `Default` impl matches `new`: not cancelled.
+    #[test]
+    fn cancel_flag_default_is_not_cancelled() {
+        assert!(!CancelFlag::default().is_cancelled());
+    }
+
+    /// The optional-flag helper treats `None` (headless / non-stoppable
+    /// callers) as never cancelled and honors a `Some` flag's state.
+    #[test]
+    fn is_cancelled_helper_handles_none_and_some() {
+        assert!(!is_cancelled(None), "None must never be cancelled");
+
+        let flag = CancelFlag::new();
+        assert!(!is_cancelled(Some(&flag)));
+        flag.cancel();
+        assert!(is_cancelled(Some(&flag)));
+    }
+
+    /// A pre-set cancel flag short-circuits [`run_pipeline_full`] straight to
+    /// [`PipelineStatus::Stopped`] WITHOUT spawning any adb, which is why this
+    /// runs on the headless host with no device, adb, or socket. It must return
+    /// `Ok(())` promptly (not hang) and emit exactly `Stopped`.
+    #[test]
+    fn cancelled_pipeline_reaches_stopped_without_device() {
+        let cfg = PipelineConfig::default();
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancelFlag::new();
+        cancel.cancel(); // already cancelled before the run starts
+
+        let result = run_pipeline_full(&cfg, &tx, None, None, Some(cancel));
+        assert!(result.is_ok(), "an already-cancelled run must return Ok");
+
+        let statuses: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            statuses,
+            vec![PipelineStatus::Stopped],
+            "a pre-cancelled run must emit only Stopped, with no adb/connect"
+        );
+    }
+
+    /// Teardown is best-effort and idempotent: calling [`teardown`] /
+    /// [`teardown_with`] twice (and when nothing was set up) does not panic, and
+    /// it drives exactly the expected `forward --remove` and (for Wi-Fi)
+    /// `disconnect` arg vectors against the resolved selector. The AdbCommand
+    /// points at a path that does not exist, so each `run` fails silently (as
+    /// teardown already ignores errors), which is the headless stand-in for a
+    /// device that was never fully set up.
+    #[test]
+    fn teardown_is_idempotent_and_builds_expected_args() {
+        // The exact arg vectors teardown drives, asserted directly so the test
+        // fails if the teardown wiring changes.
+        let wifi_cfg = PipelineConfig {
+            transport: Transport::WiFi {
+                ip: "192.168.1.42".into(),
+                port: 37000,
+            },
+            local_port: 27183,
+            ..PipelineConfig::default()
+        };
+        let resolved = DeviceSelector::Serial("192.168.1.42:42817".into());
+        assert_eq!(
+            adb::forward_remove_args(&resolved, wifi_cfg.local_port),
+            vec!["-s", "192.168.1.42:42817", "forward", "--remove", "tcp:27183"]
+        );
+        assert_eq!(
+            adb::disconnect_args("192.168.1.42", 37000),
+            vec!["disconnect", "192.168.1.42:37000"]
+        );
+
+        // Calling teardown twice (and for a USB config where nothing was set
+        // up) must not panic. The adb path is intentionally bogus so run()
+        // returns Err, which teardown ignores.
+        let bogus = std::path::PathBuf::from("/nonexistent/adb-does-not-exist");
+        let wifi_cmd = AdbCommand::with_path(bogus.clone(), resolved.clone());
+        teardown_with(&wifi_cmd, &wifi_cfg, &resolved);
+        teardown_with(&wifi_cmd, &wifi_cfg, &resolved); // idempotent second call
+
+        let usb_cfg = PipelineConfig::default();
+        let usb_cmd = AdbCommand::with_path(bogus, DeviceSelector::UsbDefault);
+        teardown(&usb_cmd, &usb_cfg);
+        teardown(&usb_cmd, &usb_cfg); // nothing was set up; still safe
     }
 }

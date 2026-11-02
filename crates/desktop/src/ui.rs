@@ -195,6 +195,10 @@ pub fn build_main_window(
     // wireless panel once it has paired/connected a device (an explicit Wi-Fi
     // transport is passed in). A guard prevents spawning duplicate pipelines.
     let started = Rc::new(Cell::new(false));
+    // Shared cooperative cancel flag: the UI trips it on Stop and the pipeline
+    // thread observes it to break its loop and run teardown exactly once. It is
+    // reset to NOT-cancelled before each spawn so a later Start runs fresh.
+    let cancel = crate::pipeline::CancelFlag::new();
     let pipeline_cfg = Arc::new(pipeline_cfg);
     let start_slot = Arc::clone(&control_slot);
     let start_status_tx = status_tx.clone();
@@ -202,11 +206,14 @@ pub fn build_main_window(
     let start_pipeline: Rc<dyn Fn(Option<crate::pipeline::Transport>)> = {
         let started = Rc::clone(&started);
         let pipeline_cfg = Arc::clone(&pipeline_cfg);
+        let cancel = cancel.clone();
         Rc::new(move |transport: Option<crate::pipeline::Transport>| {
             if started.replace(true) {
                 // Already running; nothing more to spawn.
                 return;
             }
+            // Clear any prior stop request so this fresh run is not cancelled.
+            cancel.reset();
             // Clone the base config and override the transport when the wireless
             // panel supplies a freshly discovered Wi-Fi endpoint.
             let mut cfg = (*pipeline_cfg).clone();
@@ -217,9 +224,15 @@ pub fn build_main_window(
             let status = start_status_tx.clone();
             let frames = start_frame_tx.clone();
             let slot = Arc::clone(&start_slot);
+            let cancel = cancel.clone();
             std::thread::spawn(move || {
-                let _ =
-                    crate::pipeline::run_pipeline_full(&cfg, &status, Some(frames), Some(slot));
+                let _ = crate::pipeline::run_pipeline_full(
+                    &cfg,
+                    &status,
+                    Some(frames),
+                    Some(slot),
+                    Some(cancel),
+                );
             });
         })
     };
@@ -232,6 +245,32 @@ pub fn build_main_window(
         w.set_menu_visible(false);
         w.set_connection_status("Starting...".into());
         start_for_button(None);
+    });
+
+    // Stop mirroring: end the current session and return to the Start menu
+    // WITHOUT quitting the app (distinct from on_quit). Tripping the shared
+    // cancel flag makes the pipeline thread break its loop and run the existing
+    // teardown (forward --remove, kill the server child, Wi-Fi disconnect)
+    // exactly once; the thread self-exits when run_pipeline_full returns. This
+    // is idempotent and a safe no-op when nothing is mirroring. The UI is reset
+    // to the menu state (menu re-shown, video surface cleared) and `started` is
+    // released so a later Start spawns a fresh pipeline. Remembered devices are
+    // left untouched so reconnect stays quick.
+    let weak = window.as_weak();
+    let stop_cancel = cancel.clone();
+    let stop_started = Rc::clone(&started);
+    window.on_stop_mirroring(move || {
+        stop_cancel.cancel();
+        stop_started.set(false);
+        if let Some(w) = weak.upgrade() {
+            w.set_menu_visible(true);
+            // Clear the video surface so the placeholder shows again. An empty
+            // image has width 0, which the slint fallback keys off.
+            w.set_frame(slint::Image::default());
+            w.set_connection_status("Ready".into());
+            w.set_pipeline_status("Idle".into());
+            w.set_pipeline_status_is_error(false);
+        }
     });
 
     // --- Wireless discovery / pairing panel wiring ------------------------

@@ -429,6 +429,10 @@ export component MainWindow inherits Window {
     callback start();
     callback quit();
     callback check-for-updates();
+    // End the current mirroring session and return to the Start menu WITHOUT
+    // quitting the app. Wired in src/ui.rs: it trips a cooperative cancel flag
+    // the pipeline observes to tear down cleanly, then re-shows the menu.
+    callback stop-mirroring();
     // A pointer tap on the video surface, reported as normalized coordinates
     // (0.0..=1.0) plus a pressed flag. ui.rs scales to device pixels and sends
     // it through the scrcpy control sink. This is the input-injection path.
@@ -456,10 +460,23 @@ export component MainWindow inherits Window {
                 horizontal-alignment: center;
                 wrap: word-wrap;
             }
-            Button {
-                text: "Help";
-                clicked => {
-                    root.help-toggle();
+            HorizontalBox {
+                spacing: 8px;
+                horizontal-stretch: 0;
+                // Stop / Disconnect: shown ONLY while mirroring is active (the
+                // Start menu is hidden). Ends the current session and returns to
+                // the menu without quitting the app, so the user can reconnect.
+                if !root.menu-visible: Button {
+                    text: "Stop mirroring";
+                    clicked => {
+                        root.stop-mirroring();
+                    }
+                }
+                Button {
+                    text: "Help";
+                    clicked => {
+                        root.help-toggle();
+                    }
                 }
             }
         }

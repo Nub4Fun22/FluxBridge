@@ -234,8 +234,14 @@ pub fn stream_video<R: Read>(
     };
     decoder.configure(&config)?;
 
-    stream_av_packets(reader, decoder, frame_sink)?;
+    stream_av_packets(reader, decoder, frame_sink, &never_cancel)?;
     Ok(header)
+}
+
+/// A cancel predicate that never cancels, for callers (the all-in-one
+/// [`stream_video`] entry point and tests) that do not drive a stop control.
+pub fn never_cancel() -> bool {
+    false
 }
 
 /// Run the scrcpy access-unit loop against an ALREADY-configured decoder.
@@ -251,12 +257,25 @@ pub fn stream_video<R: Read>(
 ///   (a non-empty buffer), forwarded to `frame_sink`.
 ///
 /// Returns cleanly at end of stream or when the `frame_sink` receiver is gone.
+///
+/// `should_cancel` is checked once per iteration so a cooperative stop (the
+/// "Stop mirroring" control) breaks the loop promptly between access units.
+/// Because the underlying socket read can block, the caller sets a read timeout
+/// so the loop wakes periodically and observes the flag; a timed-out read
+/// surfaces as an error and ends the loop. Callers that never cancel pass a
+/// closure that always returns `false` (see [`never_cancel`]).
 pub fn stream_av_packets<R: Read>(
     reader: &mut R,
     decoder: &mut dyn VideoDecoder,
     frame_sink: &Sender<DecodedFrame>,
+    should_cancel: &dyn Fn() -> bool,
 ) -> CoreResult<()> {
     loop {
+        if should_cancel() {
+            // A cooperative stop was requested: return cleanly so the pipeline
+            // runs its kill-child + teardown path exactly once.
+            return Ok(());
+        }
         let packet = match read_av_packet(reader) {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(()), // clean end of stream
