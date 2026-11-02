@@ -75,18 +75,62 @@ transports:
 - **USB:** plug the phone in, `adb forward tcp:<port> localabstract:scrcpy`
   tunnels a local socket to the device.
 - **Wi-Fi (automatic discovery + one-time pairing):** FluxBridge uses the
-  Android 11+ Wireless debugging flow, so you never type an IP by hand. Enable
-  Wireless debugging on the phone (same Wi-Fi as the PC), open "Connect
-  wirelessly" and click Scan. FluxBridge discovers the phone over mDNS by
-  driving `adb mdns services`. The first time, tap "Pair device with pairing
-  code" on the phone and type the shown 6-digit code; FluxBridge runs `adb pair`
-  then `adb connect` and remembers the device, so later launches reconnect
-  automatically. The one-time 6-digit code is shown only on the phone, so that
-  very first pairing is not zero-touch; everything after it is. adb itself is
-  auto-provisioned: if it is not installed, FluxBridge downloads Google's
-  official platform-tools on first use and keeps a private copy (no PATH edits,
-  no admin rights), falling back to the manual "install adb" guidance only when
-  that download is blocked offline.
+  Android 11+ Wireless debugging flow, so you never type an IP by hand. adb
+  itself is auto-provisioned: if it is not installed, FluxBridge downloads
+  Google's official platform-tools on first use and keeps a private copy (no
+  PATH edits, no admin rights), falling back to the manual "install adb"
+  guidance only when that download is blocked offline.
+
+### Wireless setup, step by step
+
+This is a one-time setup. After the first pairing FluxBridge reconnects on its
+own.
+
+1. **Enable Developer Options (one time).** On the phone open
+   Settings > About phone and tap **Build number** 7 times. The exact location
+   varies by brand: on many Samsung phones Build number lives under
+   Settings > About phone > Software information. If you cannot find it, search
+   your Settings app for "Build number".
+2. **Turn on Wireless debugging (one time).** Open
+   Settings > System > Developer options > **Wireless debugging** and switch it
+   On. Keep the phone on the same Wi-Fi network as the PC.
+3. **Open the pairing screen on the phone first, then pair.** Inside Wireless
+   debugging, tap **"Pair device with pairing code"**. The phone shows a
+   6-digit code and an IP:port. Leave that screen open: the code and the pairing
+   endpoint only exist while it is open, and the PC cannot pop it up for you
+   remotely. In FluxBridge, open **"Connect wirelessly"** from the Start menu
+   and click Scan; it discovers the phone over mDNS by driving
+   `adb mdns services`. For a phone you have never paired, use **"Pair &
+   connect"** and type the 6-digit code (not plain Connect). FluxBridge runs
+   `adb pair` then `adb connect` for you.
+4. **After the first pairing, just launch FluxBridge.** It remembers the device
+   and auto-reconnects with no code and no clicks. You only repeat step 3 if you
+   forget the device or reset Wireless debugging.
+
+To end a session, click **"Stop mirroring"** to disconnect and return to the
+Start menu without quitting the app, then Start (or "Connect wirelessly") again
+to reconnect quickly.
+
+The one-time 6-digit code is shown only on the phone and only while the "Pair
+device with pairing code" screen is open, so that very first pairing is not
+zero-touch; everything after it is.
+
+### Why FluxBridge needs Developer Options / Wireless debugging
+
+Full mirroring plus control over Wi-Fi requires adb, and adb over Wi-Fi requires
+Developer Options > Wireless debugging. There is no way around this for an app
+of this kind; scrcpy and Vysor need exactly the same thing. Android has no
+public API that lets a regular app both capture the screen and inject touches
+and keys without adb. The alternatives are weaker and out of scope:
+
+- A view-only phone-side app using MediaProjection can show the screen but
+  cannot inject input (so no control from the PC) and prompts for capture
+  permission every session.
+- Vendor tools such as Samsung DeX or Windows Phone Link work without adb but
+  are brand-specific and do not provide the same full-control mirroring.
+
+So FluxBridge asks for a one-time Developer Options setup and auto-reconnects
+afterward, rather than shipping a weaker view-only experience.
 
 The device-side server is the upstream, MIT-licensed **scrcpy server** jar,
 pushed to `/data/local/tmp` and launched with `app_process` (no app install).

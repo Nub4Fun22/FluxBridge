@@ -75,18 +75,58 @@ CONNECT OVER USB (recommended, most reliable)
 
 CONNECT OVER WI-FI (automatic discovery + one-time pairing)
 FluxBridge uses Android 11+ Wireless debugging, so you do NOT type an IP by hand.
-1. On the phone, enable Settings > Developer options > Wireless debugging and
-   keep the phone on the SAME Wi-Fi network as this PC.
-2. In FluxBridge, open 'Connect wirelessly' from the Start menu and click Scan.
+This is a one-time setup. After the first pairing FluxBridge reconnects on its
+own. Take it step by step.
+
+Step 1. Enable Developer Options on the phone (one time).
+   Open Settings > About phone and tap 'Build number' 7 times. The phone
+   confirms that you are now a developer. The exact place varies by brand: on
+   many Samsung phones 'Build number' lives under Settings > About phone >
+   Software information. If you cannot find it, search your Settings app for
+   'Build number'.
+
+Step 2. Turn on Wireless debugging (one time).
+   Open Settings > System > Developer options > Wireless debugging and switch
+   it On. Keep the phone on the SAME Wi-Fi network as this PC.
+
+Step 3. Open the pairing screen on the phone FIRST, then pair.
+   On the phone, inside Wireless debugging, tap 'Pair device with pairing code'.
+   The phone shows a 6-digit code and an IP address with a port. Leave that
+   screen open: the code and the pairing endpoint only exist while this screen
+   is on, and the PC cannot pop it up for you remotely.
+   In FluxBridge, open 'Connect wirelessly' from the Start menu and click Scan.
    FluxBridge discovers the phone automatically over mDNS (it drives
-   'adb mdns services' for you).
-3. FIRST TIME ONLY: on the phone tap 'Pair device with pairing code'. The phone
-   shows a 6-digit code. Type that code into FluxBridge and click 'Pair &
-   connect'. FluxBridge runs 'adb pair' and then 'adb connect' automatically.
-4. FluxBridge remembers the device, so the NEXT time you launch it reconnects on
-   its own with no code and no clicks.
-Honest note: the one-time 6-digit code is shown only on the phone, so that very
-first pairing cannot be fully automatic. Everything after it is.
+   'adb mdns services' for you). For a phone you have never paired before, use
+   'Pair & connect' and type the 6-digit code from the phone, NOT plain
+   Connect. FluxBridge runs 'adb pair' and then 'adb connect' for you.
+
+Step 4. After the first pairing, just launch FluxBridge.
+   FluxBridge remembers the device, so the NEXT time you start it, it
+   auto-reconnects with no code and no clicks. You only repeat Step 3 if you
+   forget the device or reset Wireless debugging.
+
+To end a session: click 'Stop mirroring' to disconnect and return to the Start
+menu without quitting the app, then Start (or 'Connect wirelessly') again to
+reconnect quickly.
+
+Honest note: the one-time 6-digit code is shown only on the phone, and only
+while the 'Pair device with pairing code' screen is open, so that very first
+pairing cannot be fully automatic. Everything after it is.
+
+WHY DOES FLUXBRIDGE NEED DEVELOPER OPTIONS / WIRELESS DEBUGGING?
+Short answer: full mirroring plus control over Wi-Fi requires adb, and adb over
+Wi-Fi requires Developer Options > Wireless debugging. There is no way around
+this for an app of this kind. scrcpy and Vysor need exactly the same thing.
+Android has no public API that lets a regular app both capture the screen and
+inject touches and keys without adb.
+The alternatives are weaker and out of scope for FluxBridge:
+- A view-only phone-side app using MediaProjection could show the screen, but it
+  cannot inject input (so no control from the PC) and it pops up a capture
+  permission prompt every single session.
+- Vendor tools such as Samsung DeX or Windows Phone Link work without adb, but
+  they are brand-specific and do not give the same full-control mirroring.
+So FluxBridge asks for a one-time Developer Options setup, and auto-reconnects
+afterward, rather than shipping a weaker view-only experience.
 
 ABOUT BLUETOOTH
 Bluetooth is NOT used for video. Live phone mirroring is H.264 at tens of
@@ -732,5 +772,34 @@ fn apply_event(
                 w.set_app_status_is_error(update_event_is_error(&event));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // HELP_TEXT is compiled only under the `gui` feature (it lives in this
+    // module, which is gated on `gui`), so this test runs when the crate is
+    // tested with `--features gui`. It guards the beginner-friendly wireless
+    // guide and the honest Developer Options rationale against silent drift.
+    use super::HELP_TEXT;
+
+    #[test]
+    fn help_text_covers_the_wireless_guide_and_rationale() {
+        // Enabling Developer Options and Wireless debugging.
+        assert!(HELP_TEXT.contains("Build number"));
+        assert!(HELP_TEXT.contains("Wireless debugging"));
+        // Pairing via the 6-digit code, open the pairing screen first.
+        assert!(HELP_TEXT.contains("Pair device with pairing code"));
+        assert!(HELP_TEXT.contains("6-digit"));
+        // Never-paired devices use Pair & connect, not plain Connect.
+        assert!(HELP_TEXT.contains("Pair & connect"));
+        // Auto-reconnect after the first pairing.
+        assert!(HELP_TEXT.contains("auto-reconnect"));
+        // The honest "Why Developer Options" rationale section.
+        assert!(HELP_TEXT.contains("WHY DOES FLUXBRIDGE NEED DEVELOPER OPTIONS"));
+        // The Stop mirroring control from FEAT-004 is mentioned.
+        assert!(HELP_TEXT.contains("Stop mirroring"));
+        // No em dashes anywhere in the help copy.
+        assert!(!HELP_TEXT.contains('\u{2014}'));
     }
 }

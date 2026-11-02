@@ -106,8 +106,17 @@ unit-tested modules:
   (`adb pair`), `adb connect` on the dynamic mDNS endpoint, and remember the
   device in a small JSON file so a returning user auto-reconnects silently. The
   one-time pairing code is required by Android and read off the phone on the
-  first pairing only. The Slint "Connect wirelessly" panel wires this on a
-  worker thread, mirroring the updater's worker-thread + channel + timer pattern.
+  first pairing only (it is shown only while the "Pair device with pairing code"
+  screen is open, so the PC cannot trigger that prompt remotely). The Slint
+  "Connect wirelessly" panel wires this on a worker thread, mirroring the
+  updater's worker-thread + channel + timer pattern. Developer Options >
+  Wireless debugging is a hard requirement: full mirror plus input injection
+  over Wi-Fi needs adb, which needs Wireless debugging, the same constraint
+  scrcpy and Vysor have. A view-only MediaProjection app (no input, per-session
+  capture prompt) or vendor tools (Samsung DeX, Phone Link) are the only
+  adb-free alternatives and are out of scope. The in-app Help and the README
+  explain this to the user, and a "Stop mirroring" control ends a session and
+  returns to the menu without quitting.
 - `crates/desktop/src/scrcpy.rs` parses and encodes the scrcpy wire format: the
   one-shot video stream header, the length-prefixed H.264 access units, and the
   scrcpy control messages for input.
