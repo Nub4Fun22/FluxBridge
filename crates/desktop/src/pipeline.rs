@@ -329,23 +329,46 @@ pub fn run_pipeline_full(
         status,
         PipelineStatus::AdbLocated(adb_path.display().to_string()),
     );
-    let cmd = AdbCommand::with_path(adb_path, selector.clone());
+    let mut cmd = AdbCommand::with_path(adb_path, selector.clone());
 
-    // 2. Wi-Fi connect.
-    if let Transport::WiFi { ip, port } = &config.transport {
+    // 2. Wi-Fi connect, then resolve the REAL adb-registered serial.
+    //
+    //    `config.selector()` for Wi-Fi is the raw `ip:connect_port` mDNS
+    //    connect address, which is only valid for the `adb connect` itself.
+    //    With Android 11+ TLS wireless debugging the serial adb actually
+    //    registers in `adb devices` is NOT reliably `ip:connect_port`, so every
+    //    subsequent `-s <serial>` command (push/forward/launch/teardown) must
+    //    target whatever adb listed. We resolve that serial here and REBIND
+    //    both the selector and the AdbCommand to it; USB keeps UsbDefault.
+    let selector = if let Transport::WiFi { ip, port } = &config.transport {
         if let Err(e) = cmd.run(&adb::connect_args(ip, *port)) {
             report(status, PipelineStatus::Error(e.to_string()));
             return Err(e);
         }
         report(status, PipelineStatus::Connected(format!("{ip}:{port}")));
-    }
+
+        let real_serial = match cmd.resolve_connected_serial(ip, *port) {
+            Ok(s) => s,
+            Err(e) => {
+                report(status, PipelineStatus::Error(e.to_string()));
+                return Err(e);
+            }
+        };
+        let resolved = DeviceSelector::Serial(real_serial.clone());
+        // Rebind the command so push/forward/launch target the resolved serial.
+        cmd = AdbCommand::with_path(cmd.adb_path.clone(), resolved.clone());
+        report(status, PipelineStatus::Connected(real_serial));
+        resolved
+    } else {
+        selector
+    };
 
     // 3. Push the server jar, resolved against the executable directory so an
     //    installed app finds the bundled jar regardless of its working dir.
     let server_jar = config.resolve_server_jar();
     if let Err(e) = cmd.run(&adb::push_server_args(&selector, &server_jar)) {
         report(status, PipelineStatus::Error(e.to_string()));
-        teardown(&cmd, config);
+        teardown_with(&cmd, config, &selector);
         return Err(e);
     }
     report(status, PipelineStatus::ServerPushed);
@@ -357,7 +380,7 @@ pub fn run_pipeline_full(
         adb::SCRCPY_SOCKET_NAME,
     )) {
         report(status, PipelineStatus::Error(e.to_string()));
-        teardown(&cmd, config);
+        teardown_with(&cmd, config, &selector);
         return Err(e);
     }
     report(status, PipelineStatus::Forwarded(config.local_port));
@@ -368,7 +391,7 @@ pub fn run_pipeline_full(
         Ok(child) => child,
         Err(e) => {
             report(status, PipelineStatus::Error(e.to_string()));
-            teardown(&cmd, config);
+            teardown_with(&cmd, config, &selector);
             return Err(e);
         }
     };
@@ -380,7 +403,7 @@ pub fn run_pipeline_full(
     // Teardown: kill the server child and remove the forward.
     let _ = server_child.kill();
     let _ = server_child.wait();
-    teardown(&cmd, config);
+    teardown_with(&cmd, config, &selector);
     report(status, PipelineStatus::Stopped);
 
     result
@@ -583,13 +606,26 @@ impl ControlSinkSlot {
     }
 }
 
-/// Best-effort teardown: remove the adb forward and (for Wi-Fi) disconnect.
+/// Best-effort teardown using the transport-derived selector.
+///
+/// Kept for callers that have not resolved a Wi-Fi serial (and for USB, where
+/// the selector is always [`DeviceSelector::UsbDefault`]). The pipeline itself
+/// uses [`teardown_with`] so it tears down against the RESOLVED serial rather
+/// than the raw `ip:connect_port`, which may not be the serial adb registered.
+pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
+    teardown_with(cmd, config, &config.selector());
+}
+
+/// Best-effort teardown against an explicit `selector`: remove the adb forward
+/// and (for Wi-Fi) disconnect.
 ///
 /// Called on both the success and failure paths. Errors are ignored because
-/// teardown must not mask the original outcome.
-pub fn teardown(cmd: &AdbCommand, config: &PipelineConfig) {
-    let selector = config.selector();
-    let _ = cmd.run(&adb::forward_remove_args(&selector, config.local_port));
+/// teardown must not mask the original outcome. The `selector` is the RESOLVED
+/// serial for a Wi-Fi connection so the forward removed is the same one that
+/// was added; the Wi-Fi `disconnect` still targets the original
+/// `ip:connect_port` the `adb connect` used.
+pub fn teardown_with(cmd: &AdbCommand, config: &PipelineConfig, selector: &DeviceSelector) {
+    let _ = cmd.run(&adb::forward_remove_args(selector, config.local_port));
     if let Transport::WiFi { ip, port } = &config.transport {
         let _ = cmd.run(&adb::disconnect_args(ip, *port));
     }
@@ -647,6 +683,57 @@ mod tests {
         } else {
             panic!("expected a Wi-Fi transport");
         }
+    }
+
+    /// The BLOCKER-fix invariant (Bug 4): after `adb connect` on the mDNS
+    /// connect port, the serial adb actually registers can differ from
+    /// `ip:connect_port`. The pipeline resolves the REAL registered serial from
+    /// `adb devices -l` and threads THAT (not the raw connect port) into push,
+    /// forward, launch, and teardown. `resolve_connected_serial` is retry-based
+    /// and impure, so this exercises the pure pieces end to end: parse a
+    /// devices sample whose port differs from the connect port, resolve the
+    /// serial, and assert every downstream arg vector carries the RESOLVED
+    /// `-s <serial>` selector rather than `192.168.1.42:37000`.
+    #[test]
+    fn resolved_serial_not_connect_port_flows_into_push_and_launch() {
+        let connect_host = "192.168.1.42";
+        let connect_port = 37000u16; // mDNS connect port used only by `adb connect`
+        let raw_connect_serial = format!("{connect_host}:{connect_port}");
+
+        // What `adb devices -l` lists: the same device under a DIFFERENT port.
+        let devices_output = "List of devices attached\n\
+            192.168.1.42:42817 device product:redfin model:Pixel_5 device:redfin transport_id:3\n";
+        let devices = crate::adb::parse_devices(devices_output);
+        let resolved = crate::adb::resolve_wireless_serial(&devices, connect_host, connect_port)
+            .expect("device for the connected host must resolve");
+        assert_eq!(
+            resolved, "192.168.1.42:42817",
+            "resolved serial must be the registered port, not the connect port"
+        );
+        assert_ne!(
+            resolved, raw_connect_serial,
+            "the fix must NOT reuse the raw connect-port serial"
+        );
+
+        let sel = DeviceSelector::Serial(resolved.clone());
+
+        // push targets the resolved serial, not ip:connect_port.
+        let push = crate::adb::push_server_args(&sel, "scrcpy-server.jar");
+        assert_eq!(push[0], "-s");
+        assert_eq!(push[1], resolved);
+        assert_ne!(push[1], raw_connect_serial);
+
+        // server launch targets the resolved serial.
+        let launch = crate::adb::server_launch_args(&sel, &ServerLaunchOptions::default());
+        assert_eq!(launch[0], "-s");
+        assert_eq!(launch[1], resolved);
+        assert_ne!(launch[1], raw_connect_serial);
+
+        // forward and forward --remove (teardown) also use the resolved serial.
+        let forward = crate::adb::forward_args(&sel, 27183, crate::adb::SCRCPY_SOCKET_NAME);
+        assert_eq!(&forward[0..2], &["-s".to_string(), resolved.clone()]);
+        let forward_remove = crate::adb::forward_remove_args(&sel, 27183);
+        assert_eq!(&forward_remove[0..2], &["-s".to_string(), resolved.clone()]);
     }
 
     #[test]

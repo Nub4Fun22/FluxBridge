@@ -372,6 +372,133 @@ pub fn parse_mdns_services(output: &str) -> Vec<MdnsService> {
     services
 }
 
+/// Build `adb devices -l` to list the devices adb currently has registered,
+/// with the long (`-l`) format that appends `key:value` descriptors. The text
+/// output is parsed by [`parse_devices`].
+///
+/// This is used right after a Wi-Fi `adb connect` to discover the REAL serial
+/// adb registered for the device. With Android 11+ TLS wireless debugging the
+/// registered serial is not reliably `ip:connect_port` (the mDNS connect port),
+/// so subsequent `-s <serial>` commands must target whatever `adb devices`
+/// actually lists, not the raw connect port.
+pub fn devices_long_args() -> Vec<String> {
+    vec!["devices".into(), "-l".into()]
+}
+
+/// One device parsed out of `adb devices -l` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdbDevice {
+    /// The serial adb registered the device under (a USB serial, or for Wi-Fi
+    /// an `ip:port` string whose port may differ from the mDNS connect port).
+    pub serial: String,
+    /// The connection state adb reported: `device` (ready), `offline`,
+    /// `unauthorized`, `bootloader`, and so on.
+    pub state: String,
+}
+
+impl AdbDevice {
+    /// Whether the device is online and ready for commands (state `device`).
+    pub fn is_online(&self) -> bool {
+        self.state == "device"
+    }
+}
+
+/// Parse the text output of `adb devices -l` into a typed device list.
+///
+/// adb prints a `List of devices attached` header followed by one line per
+/// device: the serial, the state, then (with `-l`) a run of `key:value`
+/// descriptors such as `product:... model:... device:... transport_id:N`. A
+/// representative sample:
+///
+/// ```text
+/// List of devices attached
+/// 0A1B2C3D4E5F       device product:sdk_phone model:Pixel_7 device:panther transport_id:1
+/// 192.168.1.42:42817 device product:redfin model:Pixel_5 device:redfin transport_id:3
+/// 192.168.1.99:5555  offline
+/// ```
+///
+/// Parsing mirrors [`parse_mdns_services`] and is tolerant: the header is
+/// skipped, blank lines are ignored, the first whitespace column is the serial
+/// and the second is the state, trailing descriptors are ignored, and a line
+/// without at least a serial and a state is skipped rather than erroring. Empty
+/// input yields an empty `Vec` (not an error).
+pub fn parse_devices(output: &str) -> Vec<AdbDevice> {
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip the human-readable header adb prints first.
+        if line.starts_with("List of devices") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // A device line needs at least a serial and a state; anything shorter
+        // (a stray informational line) is skipped rather than errored.
+        if cols.len() < 2 {
+            continue;
+        }
+        let serial = cols[0].to_string();
+        let state = cols[1].to_string();
+        if serial.is_empty() || state.is_empty() {
+            continue;
+        }
+        devices.push(AdbDevice { serial, state });
+    }
+    devices
+}
+
+/// Pick the REAL adb-registered serial for a just-connected Wi-Fi device.
+///
+/// After `adb connect <host>:<connect_port>` succeeds, the serial adb registers
+/// in `adb devices` is NOT reliably `host:connect_port` with Android 11+ TLS
+/// wireless debugging: adb may list the device under a different port. This
+/// resolves the serial to thread into every subsequent `-s <serial>` command
+/// (push, forward, launch, teardown) from the parsed [`AdbDevice`] list:
+///
+/// 1. Prefer an exact `host:connect_port` match (ideally online).
+/// 2. Otherwise prefer any serial starting with `host:` (a different port adb
+///    chose), preferring an online `device`-state entry.
+///
+/// Within each tier an online device is preferred over an offline/unauthorized
+/// one so the pipeline does not latch onto a serial that is not yet ready.
+/// Returns the resolved serial, or `None` when no device matching `host` is
+/// present at all.
+pub fn resolve_wireless_serial(
+    devices: &[AdbDevice],
+    host: &str,
+    connect_port: u16,
+) -> Option<String> {
+    let exact = format!("{host}:{connect_port}");
+    let host_prefix = format!("{host}:");
+
+    // Tier 1: an exact host:connect_port match, online first.
+    if let Some(d) = devices
+        .iter()
+        .find(|d| d.serial == exact && d.is_online())
+    {
+        return Some(d.serial.clone());
+    }
+    // Tier 2: any serial for this host (any port), online first.
+    if let Some(d) = devices
+        .iter()
+        .find(|d| d.serial.starts_with(&host_prefix) && d.is_online())
+    {
+        return Some(d.serial.clone());
+    }
+    // Tier 3: fall back to a matching serial even if not yet online, so the
+    // caller can surface an actionable offline/unauthorized error rather than
+    // a bare "not found". Exact match wins over a different-port match.
+    if let Some(d) = devices.iter().find(|d| d.serial == exact) {
+        return Some(d.serial.clone());
+    }
+    devices
+        .iter()
+        .find(|d| d.serial.starts_with(&host_prefix))
+        .map(|d| d.serial.clone())
+}
+
 /// Outcome of the wireless pair-then-connect orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WirelessConnection {
@@ -568,6 +695,76 @@ impl AdbCommand {
                 code: output.status.code(),
                 stderr: stdout.trim().to_string(),
             })
+        }
+    }
+
+    /// Resolve the REAL adb-registered serial for a device just connected over
+    /// Wi-Fi at `host:connect_port`.
+    ///
+    /// Runs `adb devices -l`, parses it with [`parse_devices`], and uses
+    /// [`resolve_wireless_serial`] to find the serial adb actually registered
+    /// (which, with Android 11+ TLS wireless debugging, is not reliably
+    /// `host:connect_port`). adb lags for a moment after `connect`, so this
+    /// retries a SHORT bounded number of times until the matching device is
+    /// present AND online; the retry/sleep is the only impure part, while the
+    /// parsing and resolution are pure and separately unit-tested.
+    ///
+    /// Returns the resolved serial on success. If a matching serial appears but
+    /// never reaches the `device` state within the retry budget, returns an
+    /// actionable [`AdbError::Command`] telling the user to accept the
+    /// debugging prompt (offline/unauthorized). If no device matching `host` is
+    /// ever listed, returns an [`AdbError::Command`] saying the connected
+    /// device was not found in `adb devices`.
+    pub fn resolve_connected_serial(
+        &self,
+        host: &str,
+        connect_port: u16,
+    ) -> Result<String, AdbError> {
+        /// How many times to poll `adb devices -l` before giving up.
+        const RESOLVE_ATTEMPTS: u32 = 5;
+        /// Delay between polls; adb lags briefly after `connect`.
+        const RESOLVE_SLEEP: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let args = devices_long_args();
+        let mut last_match: Option<String> = None;
+        for attempt in 0..RESOLVE_ATTEMPTS {
+            let output = self.run(&args)?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            let devices = parse_devices(&text);
+            if let Some(serial) = resolve_wireless_serial(&devices, host, connect_port) {
+                // Online and matching: done.
+                if devices
+                    .iter()
+                    .any(|d| d.serial == serial && d.is_online())
+                {
+                    return Ok(serial);
+                }
+                // Present but not yet online; remember it so a terminal
+                // offline/unauthorized state yields an actionable error.
+                last_match = Some(serial);
+            }
+            if attempt + 1 < RESOLVE_ATTEMPTS {
+                std::thread::sleep(RESOLVE_SLEEP);
+            }
+        }
+
+        match last_match {
+            Some(serial) => Err(AdbError::Command {
+                args,
+                code: None,
+                stderr: format!(
+                    "device {serial} is offline or unauthorized; accept the \
+                     wireless debugging prompt on the phone and try again"
+                ),
+            }),
+            None => Err(AdbError::Command {
+                args,
+                code: None,
+                stderr: format!(
+                    "connected device {host}:{connect_port} was not found in \
+                     `adb devices`; the connection may have dropped"
+                ),
+            }),
         }
     }
 
@@ -882,6 +1079,153 @@ mod tests {
         // skipped rather than panicking or erroring.
         assert!(parse_mdns_services("adb-bad\t_adb-tls-connect._tcp\n").is_empty());
         assert!(parse_mdns_services("adb-bad\t_adb-tls-connect._tcp\t1.2.3.4:notaport").is_empty());
+    }
+
+    #[test]
+    fn devices_long_args_exact() {
+        assert_eq!(devices_long_args(), vec!["devices", "-l"]);
+    }
+
+    #[test]
+    fn parse_devices_captured_sample_usb_and_wireless() {
+        // Representative captured `adb devices -l` output: the header, a USB
+        // device, and a wireless device whose registered port differs from any
+        // mDNS connect port, each with trailing key:value descriptors. adb uses
+        // a run of spaces for alignment, which the whitespace split tolerates.
+        let sample = "List of devices attached\n\
+            0A1B2C3D4E5F       device product:panther model:Pixel_7 device:panther transport_id:1\n\
+            192.168.1.42:42817 device product:redfin model:Pixel_5 device:redfin transport_id:3\n";
+        let devices = parse_devices(sample);
+        assert_eq!(devices.len(), 2, "two devices parsed: {devices:?}");
+
+        assert_eq!(devices[0].serial, "0A1B2C3D4E5F");
+        assert_eq!(devices[0].state, "device");
+        assert!(devices[0].is_online());
+
+        assert_eq!(devices[1].serial, "192.168.1.42:42817");
+        assert_eq!(devices[1].state, "device");
+        assert!(devices[1].is_online());
+    }
+
+    #[test]
+    fn parse_devices_captures_offline_and_unauthorized_states() {
+        let sample = "List of devices attached\n\
+            192.168.1.99:5555  offline\n\
+            9C8B7A6D           unauthorized\n";
+        let devices = parse_devices(sample);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].state, "offline");
+        assert!(!devices[0].is_online());
+        assert_eq!(devices[1].state, "unauthorized");
+        assert!(!devices[1].is_online());
+    }
+
+    #[test]
+    fn parse_devices_empty_and_header_only_and_malformed_are_safe() {
+        assert!(parse_devices("").is_empty());
+        assert!(parse_devices("List of devices attached\n").is_empty());
+        // A line with only a serial and no state is skipped, not errored.
+        assert!(parse_devices("List of devices attached\nloneserial\n").is_empty());
+    }
+
+    #[test]
+    fn parse_devices_tolerates_tab_separation() {
+        // Some outputs use tabs between the serial and state rather than the
+        // aligned spaces; the whitespace split handles both.
+        let sample = "List of devices attached\n0A1B2C3D4E5F\tdevice\n";
+        let devices = parse_devices(sample);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].serial, "0A1B2C3D4E5F");
+        assert_eq!(devices[0].state, "device");
+    }
+
+    #[test]
+    fn resolve_wireless_serial_prefers_different_registered_port() {
+        // The device connected on the mDNS connect port 37000, but adb
+        // registered it under a different port (42817). The resolver returns
+        // the registered serial, NOT the raw connect-port serial.
+        let devices = vec![
+            AdbDevice {
+                serial: "0A1B2C3D4E5F".into(),
+                state: "device".into(),
+            },
+            AdbDevice {
+                serial: "192.168.1.42:42817".into(),
+                state: "device".into(),
+            },
+        ];
+        let resolved = resolve_wireless_serial(&devices, "192.168.1.42", 37000);
+        assert_eq!(resolved.as_deref(), Some("192.168.1.42:42817"));
+    }
+
+    #[test]
+    fn resolve_wireless_serial_prefers_exact_match_when_present() {
+        let devices = vec![
+            AdbDevice {
+                serial: "192.168.1.42:37000".into(),
+                state: "device".into(),
+            },
+            AdbDevice {
+                serial: "192.168.1.42:42817".into(),
+                state: "device".into(),
+            },
+        ];
+        let resolved = resolve_wireless_serial(&devices, "192.168.1.42", 37000);
+        assert_eq!(resolved.as_deref(), Some("192.168.1.42:37000"));
+    }
+
+    #[test]
+    fn resolve_wireless_serial_prefers_online_over_offline() {
+        // An offline exact match and an online different-port match for the same
+        // host: the online one is chosen so the pipeline does not latch onto a
+        // serial that is not ready.
+        let devices = vec![
+            AdbDevice {
+                serial: "192.168.1.42:37000".into(),
+                state: "offline".into(),
+            },
+            AdbDevice {
+                serial: "192.168.1.42:42817".into(),
+                state: "device".into(),
+            },
+        ];
+        let resolved = resolve_wireless_serial(&devices, "192.168.1.42", 37000);
+        assert_eq!(resolved.as_deref(), Some("192.168.1.42:42817"));
+    }
+
+    #[test]
+    fn resolve_wireless_serial_returns_offline_match_when_none_online() {
+        // No online candidate: the resolver still returns the matching serial
+        // (so the caller can surface an actionable offline/unauthorized error),
+        // preferring the exact match.
+        let devices = vec![AdbDevice {
+            serial: "192.168.1.42:37000".into(),
+            state: "unauthorized".into(),
+        }];
+        let resolved = resolve_wireless_serial(&devices, "192.168.1.42", 37000);
+        assert_eq!(resolved.as_deref(), Some("192.168.1.42:37000"));
+    }
+
+    #[test]
+    fn resolve_wireless_serial_single_wireless_device() {
+        let devices = vec![AdbDevice {
+            serial: "10.0.0.5:44321".into(),
+            state: "device".into(),
+        }];
+        assert_eq!(
+            resolve_wireless_serial(&devices, "10.0.0.5", 44000).as_deref(),
+            Some("10.0.0.5:44321")
+        );
+    }
+
+    #[test]
+    fn resolve_wireless_serial_none_when_host_absent() {
+        let devices = vec![AdbDevice {
+            serial: "0A1B2C3D4E5F".into(),
+            state: "device".into(),
+        }];
+        assert!(resolve_wireless_serial(&devices, "192.168.1.42", 37000).is_none());
+        assert!(resolve_wireless_serial(&[], "192.168.1.42", 37000).is_none());
     }
 
     #[test]
