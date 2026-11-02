@@ -93,7 +93,21 @@ input injection today. The desktop responsibilities live in feature-independent,
 unit-tested modules:
 
 - `crates/desktop/src/adb.rs` builds the adb command lines (discovery, `push`,
-  `forward`, `connect`, and `app_process` launch) as pure functions.
+  `forward`, `connect`, `pair`, `mdns services`, and `app_process` launch) as
+  pure functions, and parses `adb mdns services` output into typed services.
+- `crates/desktop/src/provision.rs` auto-provisions adb: when it is not already
+  installed, FluxBridge downloads Google's official platform-tools into a
+  per-user data dir and uses the bundled copy directly, so a non-technical user
+  never installs the SDK or edits PATH. The download/extract/path logic is pure
+  and tested offline with a fake transport and a synthetic in-memory zip.
+- `crates/desktop/src/wireless_ui.rs` + `devices.rs` implement the Android 11+
+  wireless-debugging flow: discover devices over mDNS (by driving `adb mdns
+  services`), pair a new device once with the 6-digit code the phone shows
+  (`adb pair`), `adb connect` on the dynamic mDNS endpoint, and remember the
+  device in a small JSON file so a returning user auto-reconnects silently. The
+  one-time pairing code is required by Android and read off the phone on the
+  first pairing only. The Slint "Connect wirelessly" panel wires this on a
+  worker thread, mirroring the updater's worker-thread + channel + timer pattern.
 - `crates/desktop/src/scrcpy.rs` parses and encodes the scrcpy wire format: the
   one-shot video stream header, the length-prefixed H.264 access units, and the
   scrcpy control messages for input.

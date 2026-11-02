@@ -34,6 +34,7 @@ use crate::pipeline::{ControlSinkSlot, PipelineConfig};
 use crate::updater_ui::{
     run_update, spawn_update_check, update_event_is_error, update_event_status, UpdateEvent,
 };
+use crate::wireless_ui::{self, WirelessEvent};
 
 /// The in-app help / "how to connect" guide shown by the Help panel.
 ///
@@ -52,8 +53,10 @@ then streams H.264 video back over that forwarded socket and decodes it here.
 
 WHAT YOU NEED
 - This FluxBridge desktop client (you are running it).
-- adb installed on the PC (part of the Android platform tools). FluxBridge looks
-  for adb on your PATH and in the usual Android SDK locations.
+- adb (part of the Android platform tools). You do NOT have to install it:
+  FluxBridge looks for adb on your PATH and in the usual Android SDK locations,
+  and if it is missing it downloads Google's official platform-tools for you on
+  first use and keeps a private copy.
 - An Android phone with Developer Options and USB debugging enabled:
   Settings > About phone > tap Build number 7 times, then
   Settings > System > Developer options > USB debugging.
@@ -70,16 +73,20 @@ CONNECT OVER USB (recommended, most reliable)
          app_process / com.genymobile.scrcpy.Server
    then dials 127.0.0.1:27183, which adb tunnels to the phone.
 
-CONNECT OVER WI-FI
-1. Connect the phone over USB once and switch adb to TCP/IP, then find its IP:
-     adb tcpip 5555
-     adb shell ip route        (note the wlan0 address, e.g. 192.168.1.42)
-2. Unplug. Launch FluxBridge with the phone's address, for example:
-     fluxbridge-desktop 192.168.1.42
-   FluxBridge runs 'adb connect 192.168.1.42:5555' and then the same
-   push / forward / launch flow as USB.
-Note: wireless mDNS auto-pairing (no manual adb connect) is planned; until then
-use the steps above.
+CONNECT OVER WI-FI (automatic discovery + one-time pairing)
+FluxBridge uses Android 11+ Wireless debugging, so you do NOT type an IP by hand.
+1. On the phone, enable Settings > Developer options > Wireless debugging and
+   keep the phone on the SAME Wi-Fi network as this PC.
+2. In FluxBridge, open 'Connect wirelessly' from the Start menu and click Scan.
+   FluxBridge discovers the phone automatically over mDNS (it drives
+   'adb mdns services' for you).
+3. FIRST TIME ONLY: on the phone tap 'Pair device with pairing code'. The phone
+   shows a 6-digit code. Type that code into FluxBridge and click 'Pair &
+   connect'. FluxBridge runs 'adb pair' and then 'adb connect' automatically.
+4. FluxBridge remembers the device, so the NEXT time you launch it reconnects on
+   its own with no code and no clicks.
+Honest note: the one-time 6-digit code is shown only on the phone, so that very
+first pairing cannot be fully automatic. Everything after it is.
 
 ABOUT BLUETOOTH
 Bluetooth is NOT used for video. Live phone mirroring is H.264 at tens of
@@ -101,8 +108,12 @@ available you will be offered it; otherwise you will see a short confirmation
 that you are on the latest version.
 
 TROUBLESHOOTING
-- 'adb not found': install the Android platform tools and make sure adb is on
-  your PATH (or under ANDROID_HOME / ANDROID_SDK_ROOT).
+- 'adb not found': you normally do not need to do anything. The first time it is
+  needed, FluxBridge downloads Google's official Android platform-tools for you
+  and keeps a private copy, so adb never has to be installed or put on PATH by
+  hand. If that download is blocked (no internet, a firewall, or an offline PC),
+  install the Android platform tools yourself and make sure adb is on your PATH
+  (or under ANDROID_HOME / ANDROID_SDK_ROOT).
 - 'no device' / cannot connect: confirm the phone is plugged in and authorized
   (USB) or reachable at its IP (Wi-Fi), and that USB debugging is enabled.
 - Wrong address: pass the correct host:port when launching the client.";
@@ -179,29 +190,53 @@ pub fn build_main_window(
     // input injection a real, exercised path (not dead code).
     let control_slot = Arc::new(ControlSinkSlot::new());
 
-    // Start: hide the menu and begin the adb-driven pipeline on a worker thread.
-    // Only started once (a guard prevents spawning duplicate pipelines).
+    // Start the adb-driven pipeline on a worker thread. Shared by the Start
+    // button (USB / auto-reconnect transport from the config) and by the
+    // wireless panel once it has paired/connected a device (an explicit Wi-Fi
+    // transport is passed in). A guard prevents spawning duplicate pipelines.
     let started = Rc::new(Cell::new(false));
-    let weak = window.as_weak();
     let pipeline_cfg = Arc::new(pipeline_cfg);
     let start_slot = Arc::clone(&control_slot);
+    let start_status_tx = status_tx.clone();
+    let start_frame_tx = frame_tx.clone();
+    let start_pipeline: Rc<dyn Fn(Option<crate::pipeline::Transport>)> = {
+        let started = Rc::clone(&started);
+        let pipeline_cfg = Arc::clone(&pipeline_cfg);
+        Rc::new(move |transport: Option<crate::pipeline::Transport>| {
+            if started.replace(true) {
+                // Already running; nothing more to spawn.
+                return;
+            }
+            // Clone the base config and override the transport when the wireless
+            // panel supplies a freshly discovered Wi-Fi endpoint.
+            let mut cfg = (*pipeline_cfg).clone();
+            if let Some(t) = transport {
+                cfg.transport = t;
+            }
+            let cfg = Arc::new(cfg);
+            let status = start_status_tx.clone();
+            let frames = start_frame_tx.clone();
+            let slot = Arc::clone(&start_slot);
+            std::thread::spawn(move || {
+                let _ =
+                    crate::pipeline::run_pipeline_full(&cfg, &status, Some(frames), Some(slot));
+            });
+        })
+    };
+
+    // Start button: hide the menu and begin mirroring with the config transport.
+    let weak = window.as_weak();
+    let start_for_button = Rc::clone(&start_pipeline);
     window.on_start(move || {
         let Some(w) = weak.upgrade() else { return };
-        if started.replace(true) {
-            // Already running; just make sure the menu is dismissed.
-            w.set_menu_visible(false);
-            return;
-        }
         w.set_menu_visible(false);
         w.set_connection_status("Starting...".into());
-        let cfg = Arc::clone(&pipeline_cfg);
-        let status = status_tx.clone();
-        let frames = frame_tx.clone();
-        let slot = Arc::clone(&start_slot);
-        std::thread::spawn(move || {
-            let _ = crate::pipeline::run_pipeline_full(&cfg, &status, Some(frames), Some(slot));
-        });
+        start_for_button(None);
     });
+
+    // --- Wireless discovery / pairing panel wiring ------------------------
+
+    wire_wireless_panel(&window, Rc::clone(&start_pipeline));
 
     // Video pointer input: scale normalized surface coordinates to device
     // pixels and forward a tap (down then up) through the scrcpy control sink.
@@ -292,6 +327,131 @@ pub fn build_main_window(
     pump_events(&window, update_events, worker_rx, current_release);
 
     Ok(window)
+}
+
+/// Wire the wireless discovery / pairing panel: open/close toggles, the
+/// scan/pair/connect callbacks (each spawns a background worker so the UI event
+/// loop never blocks on adb or the network), and a timer that drains
+/// [`WirelessEvent`]s onto the panel's status line and device list. On a
+/// [`WirelessEvent::Connected`] the shared `start_pipeline` closure is invoked
+/// with the discovered Wi-Fi transport so mirroring begins on the just-connected
+/// device, following the same worker-thread + mpsc + `slint::Timer` pattern the
+/// updater uses.
+fn wire_wireless_panel(
+    window: &MainWindow,
+    start_pipeline: Rc<dyn Fn(Option<crate::pipeline::Transport>)>,
+) {
+    // Open/close the panel.
+    let weak = window.as_weak();
+    window.on_wireless_toggle(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_wireless_visible(!w.get_wireless_visible());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_wireless_close(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_wireless_visible(false);
+        }
+    });
+
+    // Worker -> UI event channel, drained by the timer below.
+    let (tx, rx) = mpsc::channel::<WirelessEvent>();
+
+    // Scan for devices.
+    let scan_tx = tx.clone();
+    let weak = window.as_weak();
+    window.on_wireless_scan(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_wireless_busy(true);
+            w.set_wireless_status("Scanning...".into());
+            w.set_wireless_status_is_error(false);
+        }
+        let tx = scan_tx.clone();
+        std::thread::spawn(move || {
+            wireless_ui::scan(&tx);
+        });
+    });
+
+    // Pair a new device with the typed 6-digit code, then connect.
+    let pair_tx = tx.clone();
+    let weak = window.as_weak();
+    window.on_wireless_pair_and_connect(move |code, id| {
+        if let Some(w) = weak.upgrade() {
+            w.set_wireless_busy(true);
+            w.set_wireless_status("Pairing...".into());
+            w.set_wireless_status_is_error(false);
+        }
+        let tx = pair_tx.clone();
+        let code = code.to_string();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            wireless_ui::pair_and_connect(&tx, &code, &id);
+        });
+    });
+
+    // Connect an already-paired device selected from the list.
+    let connect_tx = tx.clone();
+    let weak = window.as_weak();
+    window.on_wireless_connect_device(move |id| {
+        if let Some(w) = weak.upgrade() {
+            w.set_wireless_busy(true);
+            w.set_wireless_status("Connecting...".into());
+            w.set_wireless_status_is_error(false);
+        }
+        let tx = connect_tx.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            wireless_ui::connect_device(&tx, &id);
+        });
+    });
+
+    // Drain wireless worker events into the panel properties on a UI-thread
+    // timer, starting the pipeline when a device connects.
+    let timer = Rc::new(slint::Timer::default());
+    let weak = window.as_weak();
+    let events = Rc::new(rx);
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            for event in events.try_iter() {
+                match event {
+                    WirelessEvent::Status(msg) => {
+                        w.set_wireless_status(msg.into());
+                        w.set_wireless_status_is_error(false);
+                    }
+                    WirelessEvent::Error(msg) => {
+                        w.set_wireless_status(msg.into());
+                        w.set_wireless_status_is_error(true);
+                        w.set_wireless_busy(false);
+                    }
+                    WirelessEvent::Devices(list) => {
+                        let model: Vec<DiscoveredDevice> = list
+                            .into_iter()
+                            .map(|d| DiscoveredDevice {
+                                label: d.label.into(),
+                                id: d.id.into(),
+                            })
+                            .collect();
+                        w.set_wireless_devices(
+                            std::rc::Rc::new(slint::VecModel::from(model)).into(),
+                        );
+                        w.set_wireless_busy(false);
+                    }
+                    WirelessEvent::Connected(transport) => {
+                        w.set_wireless_busy(false);
+                        w.set_wireless_visible(false);
+                        w.set_menu_visible(false);
+                        w.set_connection_status("Starting...".into());
+                        start_pipeline(Some(transport));
+                    }
+                }
+            }
+        },
+    );
+    std::mem::forget(timer);
 }
 
 /// Drain [`PipelineStatus`](crate::pipeline::PipelineStatus) updates from the

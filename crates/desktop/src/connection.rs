@@ -9,12 +9,11 @@
 //!   handshake.
 //! * A reader loop that frames packets off the stream and forwards every
 //!   decoded [`Packet`] onto an `mpsc` channel the decode loop consumes.
-//! * A documented reconnect-loop stub and an mDNS auto-pairing hook (Phase 2).
+//! * A documented reconnect-loop stub and an mDNS discovery helper that drives
+//!   adb's own wireless-debugging mDNS browser (see [`discover_via_mdns`]).
 //!
 //! The implementation is deliberately `std`-only (blocking `TcpStream` on a
-//! background thread) so the scaffold has no async runtime dependency. The
-//! `docs/ROADMAP.md` Phase 2 notes describe swapping in tokio when wireless
-//! auto-docking lands.
+//! background thread) so the scaffold has no async runtime dependency.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -259,18 +258,36 @@ pub fn reconnect_with_backoff(
     }
 }
 
-/// mDNS auto-pairing hook (Phase 2).
+/// Discover a wireless-debugging device on the LAN via mDNS.
 ///
-/// Wireless auto-docking will advertise/browse the `_fluxbridge._tcp.local`
-/// service via mDNS so the desktop discovers phones on the LAN without manual
-/// IP entry. This stub documents the integration point; the real resolver
-/// (e.g. the `mdns-sd` crate) is added when Phase 2 begins. It currently
-/// returns the configured default so the rest of the app can call it today.
+/// This is implemented by driving adb's OWN mDNS browser rather than shipping a
+/// second mDNS stack: it locates adb ([`crate::adb::locate_adb`]), runs
+/// `adb mdns services` ([`crate::adb::AdbCommand::mdns_services`]), and returns
+/// a [`ConnectionConfig`] for the first `_adb-tls-connect._tcp` endpoint found.
+/// See [`crate::adb::parse_mdns_services`] for the parser (unit-tested against a
+/// captured sample) and [`crate::devices`] for remembering a paired device so a
+/// returning user auto-reconnects.
+///
+/// Note the returned config points at the DEVICE's discovered connect endpoint.
+/// The mirroring pipeline does the actual `adb connect` and then tunnels the
+/// scrcpy socket through `adb forward` to `127.0.0.1`; this helper exists so a
+/// caller can surface the discovered address (and so a `None` honestly means
+/// "nothing discovered / adb unavailable", never a left-over Phase 2 stub).
+///
+/// Returns `None` when adb is not installed, the mDNS query fails, or no
+/// connect endpoint has been advertised yet (for example the phone's Wireless
+/// debugging screen is not open). That is not an error: callers fall back to
+/// the configured/default target or the pairing UX.
 pub fn discover_via_mdns() -> Option<ConnectionConfig> {
-    // TODO(phase-2): browse `_fluxbridge._tcp.local`, resolve the first host,
-    // and return its address. Returning None here means "fall back to the
-    // configured/default target".
-    None
+    let adb_path = crate::adb::locate_adb().ok()?;
+    let cmd = crate::adb::AdbCommand::with_path(adb_path, crate::adb::DeviceSelector::UsbDefault);
+    let services = cmd.mdns_services().ok()?;
+    let connect = services.into_iter().find(|s| s.is_connect())?;
+    Some(ConnectionConfig {
+        host: connect.host,
+        port: connect.port,
+        read_timeout: ConnectionConfig::default().read_timeout,
+    })
 }
 
 #[cfg(test)]
@@ -297,9 +314,31 @@ mod tests {
         assert_eq!(cfg.address(), "127.0.0.1:27183");
     }
 
+    /// `discover_via_mdns` drives adb's real mDNS browser. On this headless CI
+    /// host adb is not installed, so the call honestly returns `None` (adb
+    /// unavailable), NOT because it is an unimplemented Phase 2 stub. The live
+    /// discovery path (adb present, phone advertising) is verified by the user
+    /// on Windows; the parser it depends on is unit-tested in `adb.rs` against
+    /// a captured sample.
+    ///
+    /// The lookup reads process-global env (`PATH`, `ANDROID_HOME`, ...), so it
+    /// goes through the shared env lock and strips those vars to force the
+    /// adb-absent outcome deterministically, matching the other env-touching
+    /// desktop tests.
     #[test]
-    fn mdns_stub_returns_none() {
-        assert!(discover_via_mdns().is_none());
+    fn discover_via_mdns_returns_none_when_adb_absent() {
+        crate::test_env::with_env_lock(|| {
+            std::env::remove_var("ANDROID_HOME");
+            std::env::remove_var("ANDROID_SDK_ROOT");
+            std::env::set_var("PATH", "/nonexistent-path-xyz");
+            std::env::remove_var("HOME");
+            std::env::remove_var("LOCALAPPDATA");
+            std::env::remove_var("XDG_DATA_HOME");
+            assert!(
+                discover_via_mdns().is_none(),
+                "with adb absent, discovery yields None (no stub, no panic)"
+            );
+        });
     }
 
     /// End-to-end loopback test of the socket seam: handshake over the real

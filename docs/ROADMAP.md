@@ -33,8 +33,24 @@ default build and tests are green and the `gui` build compiles):
   set as the live Slint window icon, embedded into the Windows `.exe`, and wired
   into the installer's Setup icon and shortcuts.
 - UX fixes: no stray console window on the Windows GUI release build, a
-  scrollable Help panel, and a landing Start menu (Start / Check for updates /
-  Help / Quit).
+  scrollable Help panel, and a landing Start menu (Start / Connect wirelessly /
+  Check for updates / Help / Quit).
+- Zero-setup adb: when adb is not installed, FluxBridge downloads Google's
+  official platform-tools into a per-user data dir on first use and uses the
+  bundled copy directly (no PATH edits, no admin rights), with a graceful
+  offline fallback to the manual install guidance
+  (`crates/desktop/src/provision.rs`). The download/extract/path logic is pure
+  and unit-tested with a fake transport and a synthetic in-memory zip.
+- mDNS wireless auto-pairing (Android 11+ Wireless debugging): discover devices
+  by driving `adb mdns services` and parsing its output, pair a new device once
+  with the 6-digit code the phone shows (`adb pair`), `adb connect` on the
+  dynamic mDNS endpoint, and remember the device so later launches auto-reconnect
+  silently (`crates/desktop/src/adb.rs`, `devices.rs`, `wireless_ui.rs`, and the
+  Slint "Connect wirelessly" panel). The mDNS parsing, endpoint selection, code
+  validation, and device persistence are pure and unit-tested; the live
+  discovery/pairing/mirroring is verified by the user on Windows with a phone.
+  The one-time 6-digit code is required by Android and is read off the phone on
+  the first pairing only.
 
 What is WIRED but not yet verified end to end: live device streaming and input
 injection. The transport, scrcpy framing, control encoding, and decode seam are
@@ -48,8 +64,8 @@ and wired but not yet field-verified.
 
 Still deferred (tracked in the phases below, with Bluetooth video explicitly
 NOT viable): bi-directional drag-and-drop, semantic clipboard sync, the floating
-tray "pill", the virtual secondary display, the developer side panel, mDNS
-wireless auto-pairing, and iOS. Bluetooth is not a video transport: its
+tray "pill", the virtual secondary display, the developer side panel, and iOS.
+Bluetooth is not a video transport: its
 bandwidth is roughly one to two orders of magnitude too low for live H.264, so
 it could only ever be a future low-bandwidth side channel (clipboard,
 notifications), never the screen stream.
@@ -72,8 +88,9 @@ notifications), never the screen stream.
 - Semantic clipboard sync (text, indented code, images) with searchable history.
 - Floating tray "pill" widget: 2FA SMS code extraction, media controls,
   battery/signal, without the full video stream running.
-- Wireless auto-pairing via mDNS discovery and reconnection; global shortcuts
-  (for example Alt+Space to show, Esc to hide).
+- Global shortcuts (for example Alt+Space to show, Esc to hide). Note: wireless
+  auto-pairing via mDNS discovery and silent reconnection is already DELIVERED
+  (see the Android v1 functional milestone above), ahead of the original phasing.
 
 ## Phase 3: Auto-update module, iOS capture and actions
 

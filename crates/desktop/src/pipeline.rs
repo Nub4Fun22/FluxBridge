@@ -35,9 +35,31 @@ pub enum Transport {
     WiFi {
         /// Device IP address.
         ip: String,
-        /// Device adb TCP/IP port (typically 5555).
+        /// Device adb connect port. For Android 11+ wireless debugging this is
+        /// the DYNAMIC `_adb-tls-connect._tcp` port discovered via mDNS (see
+        /// [`crate::adb::parse_mdns_services`]), NOT the legacy fixed 5555 used
+        /// after `adb tcpip`. Use [`Transport::wifi`] /
+        /// [`Transport::from_wireless`] so the discovered port flows through
+        /// instead of a hardcoded value.
         port: u16,
     },
+}
+
+impl Transport {
+    /// A Wi-Fi transport for a device reached at `host:connect_port`, where
+    /// `connect_port` is the mDNS-discovered (dynamic) connect port.
+    pub fn wifi(host: impl Into<String>, connect_port: u16) -> Self {
+        Transport::WiFi {
+            ip: host.into(),
+            port: connect_port,
+        }
+    }
+
+    /// A Wi-Fi transport built from a completed wireless pair/connect result,
+    /// carrying its discovered connect host and port into the pipeline.
+    pub fn from_wireless(conn: &crate::adb::WirelessConnection) -> Self {
+        Transport::wifi(conn.host.clone(), conn.connect_port)
+    }
 }
 
 /// Inputs needed to start the mirroring pipeline.
@@ -123,6 +145,20 @@ fn exe_dir() -> Option<std::path::PathBuf> {
 pub enum PipelineStatus {
     /// adb was located at the given path.
     AdbLocated(String),
+    /// adb was not found, so FluxBridge is downloading Google's platform-tools;
+    /// carries a `0..=100` download percentage.
+    ProvisioningAdb(u8),
+    /// The downloaded platform-tools are being extracted.
+    ExtractingAdb,
+    /// adb was auto-provisioned (downloaded + extracted) at the given path.
+    AdbProvisioned(String),
+    /// Browsing the LAN for wireless-debugging devices via adb's mDNS.
+    Discovering,
+    /// Pairing with a device using the 6-digit code shown on the phone; carries
+    /// the `host:port` pairing endpoint.
+    Pairing(String),
+    /// The one-time pairing with the device succeeded.
+    Paired(String),
     /// A Wi-Fi `adb connect` to the device succeeded.
     Connected(String),
     /// The scrcpy server jar was pushed to the device.
@@ -143,6 +179,14 @@ impl fmt::Display for PipelineStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PipelineStatus::AdbLocated(p) => write!(f, "adb located at {p}"),
+            PipelineStatus::ProvisioningAdb(pct) => {
+                write!(f, "Downloading Android platform-tools... {pct}%")
+            }
+            PipelineStatus::ExtractingAdb => write!(f, "Extracting Android platform-tools..."),
+            PipelineStatus::AdbProvisioned(p) => write!(f, "adb installed at {p}"),
+            PipelineStatus::Discovering => write!(f, "searching for wireless devices..."),
+            PipelineStatus::Pairing(s) => write!(f, "pairing with {s}..."),
+            PipelineStatus::Paired(s) => write!(f, "paired with {s}"),
             PipelineStatus::Connected(s) => write!(f, "connected to {s}"),
             PipelineStatus::ServerPushed => write!(f, "server pushed to device"),
             PipelineStatus::Forwarded(p) => write!(f, "forwarding 127.0.0.1:{p}"),
@@ -157,6 +201,67 @@ impl fmt::Display for PipelineStatus {
 /// Send a status, ignoring a dropped receiver (the UI may have closed).
 fn report(tx: &Sender<PipelineStatus>, status: PipelineStatus) {
     let _ = tx.send(status);
+}
+
+/// Locate adb, auto-provisioning it if it cannot be found.
+///
+/// First tries [`crate::adb::locate_or_provisioned`] (which prefers a bundled
+/// copy already under the per-user data dir, then the SDK/PATH/fixed-location
+/// search). If that fails with [`adb::AdbError::NotFound`], FluxBridge
+/// downloads and extracts Google's official platform-tools via
+/// [`crate::provision::ensure_adb`], reporting download/extract progress as
+/// [`PipelineStatus`] updates, and returns the bundled adb path.
+///
+/// On a provisioning failure (for example no network access offline) the
+/// original [`adb::AdbError::NotFound`] is returned unchanged, so the caller
+/// surfaces the existing actionable "install Android platform-tools" guidance
+/// rather than an opaque download error. The one-time download and the bundled
+/// adb execution are only reachable on the user's machine and are verified
+/// there; the headless host has no network guarantee and no adb.
+fn locate_or_provision_adb(status: &Sender<PipelineStatus>) -> Result<std::path::PathBuf, adb::AdbError> {
+    // Resolve the per-user data dir once; if it cannot be resolved, fall back
+    // to the plain search (which still works when adb is already installed).
+    let data_dir = crate::provision::data_dir().ok();
+
+    let located = match &data_dir {
+        Some(dir) => adb::locate_or_provisioned(dir),
+        None => adb::locate_adb(),
+    };
+
+    let not_found = match located {
+        Ok(path) => return Ok(path),
+        Err(e @ adb::AdbError::NotFound { .. }) => e,
+        // A non-NotFound error (I/O) is not something provisioning fixes.
+        Err(e) => return Err(e),
+    };
+
+    // adb is absent: try to auto-provision it. If we have no data dir there is
+    // nowhere to install it, so surface the original NotFound guidance.
+    let dir = match data_dir {
+        Some(dir) => dir,
+        None => return Err(not_found),
+    };
+
+    let mut on_progress = |p: crate::provision::ProvisionProgress| match p {
+        crate::provision::ProvisionProgress::Downloading(pct) => {
+            report(status, PipelineStatus::ProvisioningAdb(pct));
+        }
+        crate::provision::ProvisionProgress::Extracting => {
+            report(status, PipelineStatus::ExtractingAdb);
+        }
+        crate::provision::ProvisionProgress::Done(path) => {
+            report(status, PipelineStatus::AdbProvisioned(path.display().to_string()));
+        }
+    };
+
+    let transport = fluxbridge_updater::UreqTransport::default();
+    match crate::provision::ensure_adb(&dir, &transport, &mut on_progress) {
+        Ok(path) => Ok(path),
+        // Provisioning failed (offline, extract error, ...). Return the
+        // original NotFound so the user still gets the actionable install
+        // guidance that the AdbError::NotFound Display text carries.
+        Err(_) => Err(not_found),
+    }
 }
 
 /// Perform the adb-driven startup and run the decode loop, reporting progress
@@ -207,8 +312,13 @@ pub fn run_pipeline_full(
 ) -> Result<(), adb::AdbError> {
     let selector = config.selector();
 
-    // 1. Locate adb.
-    let adb_path = match adb::locate_adb() {
+    // 1. Locate adb, preferring a previously provisioned bundled copy. If adb
+    //    cannot be found anywhere, auto-provision it (download + extract
+    //    Google's official platform-tools into the per-user data dir) before
+    //    failing, so a non-technical user never has to install the SDK. A
+    //    download/extract failure (for example offline) falls back to the
+    //    existing actionable "install adb" guidance.
+    let adb_path = match locate_or_provision_adb(status) {
         Ok(p) => p,
         Err(e) => {
             report(status, PipelineStatus::Error(e.to_string()));
@@ -511,6 +621,34 @@ mod tests {
         );
     }
 
+    /// A Wi-Fi transport built from an mDNS-DISCOVERED connect endpoint (a
+    /// dynamic port, not the legacy 5555) routes through the same path as USB:
+    /// its selector is the `host:connect_port` serial and `adb connect` targets
+    /// exactly that discovered host:port.
+    #[test]
+    fn wifi_from_discovered_connect_port_yields_serial_and_connect_args() {
+        let wc = crate::adb::WirelessConnection {
+            host: "192.168.1.42".into(),
+            connect_port: 37000, // dynamic mDNS connect port, NOT 5555
+        };
+        let cfg = PipelineConfig {
+            transport: Transport::from_wireless(&wc),
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            cfg.selector(),
+            DeviceSelector::Serial("192.168.1.42:37000".into())
+        );
+        if let Transport::WiFi { ip, port } = &cfg.transport {
+            assert_eq!(
+                crate::adb::connect_args(ip, *port),
+                vec!["connect", "192.168.1.42:37000"]
+            );
+        } else {
+            panic!("expected a Wi-Fi transport");
+        }
+    }
+
     #[test]
     fn connection_config_points_at_local_forward() {
         let cfg = PipelineConfig {
@@ -629,34 +767,37 @@ mod tests {
     /// PATH for the duration of the call.
     #[test]
     fn missing_adb_reports_error_through_channel() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Serialize through the crate-wide process-global env lock so this
+        // never races another env-mutating test (env vars are process-global;
+        // independent locks would not serialize against each other).
+        // `with_env_lock` saves/restores the full shared key set, so we only
+        // apply the mutations this test needs inside the closure.
+        //
+        // We strip the SDK vars and PATH so adb cannot be found, AND the vars
+        // `directories` uses to resolve the data dir (HOME / XDG_DATA_HOME on
+        // unix, LOCALAPPDATA on Windows) so `provision::data_dir()` returns
+        // None and the pipeline does NOT attempt a live platform-tools
+        // download from this headless host. We are asserting the
+        // offline-fallback path: no data dir -> the original NotFound guidance
+        // is surfaced.
+        let mut result = None;
+        let mut statuses: Vec<PipelineStatus> = Vec::new();
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var("ANDROID_HOME", "/nonexistent-sdk-xyz");
+            std::env::remove_var("ANDROID_SDK_ROOT");
+            std::env::set_var("PATH", "/nonexistent-path-xyz");
+            std::env::remove_var("HOME");
+            std::env::remove_var("LOCALAPPDATA");
+            std::env::remove_var("XDG_DATA_HOME");
 
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            ["ANDROID_HOME", "ANDROID_SDK_ROOT", "PATH", "HOME", "LOCALAPPDATA"]
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
-        std::env::set_var("ANDROID_HOME", "/nonexistent-sdk-xyz");
-        std::env::remove_var("ANDROID_SDK_ROOT");
-        std::env::set_var("PATH", "/nonexistent-path-xyz");
-        std::env::remove_var("HOME");
-        std::env::remove_var("LOCALAPPDATA");
+            let (tx, rx) = mpsc::channel();
+            let cfg = PipelineConfig::default();
+            result = Some(run_pipeline(&cfg, &tx));
+            statuses = rx.try_iter().collect();
+        });
 
-        let (tx, rx) = mpsc::channel();
-        let cfg = PipelineConfig::default();
-        let result = run_pipeline(&cfg, &tx);
-
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-
+        let result = result.expect("pipeline ran under the env lock");
         assert!(result.is_err(), "missing adb must return Err");
-        let statuses: Vec<PipelineStatus> = rx.try_iter().collect();
         assert!(
             matches!(statuses.last(), Some(PipelineStatus::Error(_))),
             "an Error status must be reported, got {statuses:?}"
@@ -672,6 +813,42 @@ mod tests {
         assert_eq!(
             PipelineStatus::Error("no device".into()).to_string(),
             "error: no device"
+        );
+    }
+
+    /// The adb auto-provisioning status variants render human-readable text the
+    /// GUI can show on its status line (download percent, extraction, done).
+    #[test]
+    fn provisioning_status_display_is_human_readable() {
+        assert_eq!(
+            PipelineStatus::ProvisioningAdb(42).to_string(),
+            "Downloading Android platform-tools... 42%"
+        );
+        assert_eq!(
+            PipelineStatus::ExtractingAdb.to_string(),
+            "Extracting Android platform-tools..."
+        );
+        assert_eq!(
+            PipelineStatus::AdbProvisioned("/data/platform-tools/adb".into()).to_string(),
+            "adb installed at /data/platform-tools/adb"
+        );
+    }
+
+    /// The wireless discovery/pairing status variants render human-readable
+    /// text for the UI status line.
+    #[test]
+    fn wireless_status_display_is_human_readable() {
+        assert_eq!(
+            PipelineStatus::Discovering.to_string(),
+            "searching for wireless devices..."
+        );
+        assert_eq!(
+            PipelineStatus::Pairing("192.168.1.42:41355".into()).to_string(),
+            "pairing with 192.168.1.42:41355..."
+        );
+        assert_eq!(
+            PipelineStatus::Paired("192.168.1.42:37000".into()).to_string(),
+            "paired with 192.168.1.42:37000"
         );
     }
 }

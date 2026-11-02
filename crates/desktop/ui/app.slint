@@ -6,7 +6,17 @@
 // in-app updater: release notes, a download progress bar bound to a property,
 // and exactly two buttons labelled "Actualizeaza acum" and "Mai tarziu / Refuza".
 
-import { Button, VerticalBox, HorizontalBox, ProgressIndicator, ScrollView } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, ProgressIndicator, ScrollView, LineEdit, ListView } from "std-widgets.slint";
+
+// One mDNS-discovered wireless-debugging device, surfaced in the pairing panel.
+// `id` is the stable identifier the Rust side uses to act on a row (the mDNS
+// instance name when known, otherwise the host:port address).
+export struct DiscoveredDevice {
+    // The display label, for example "adb-ABCDEF0123 (192.168.1.42:37000)".
+    label: string,
+    // The stable identifier passed back to connect-device / pair-and-connect.
+    id: string,
+}
 
 // Non-intrusive update notification dialog. Shown only when an update is
 // available. The two action callbacks are wired in src/updater_ui.rs.
@@ -151,6 +161,165 @@ component HelpDialog inherits Rectangle {
     }
 }
 
+// Wireless discovery / one-time-code pairing panel. Shown from the Start menu's
+// "Connect wirelessly" button. Mirrors the HelpDialog/UpdateDialog style: a
+// titled Rectangle with in/out properties, callbacks, and std-widgets.
+//
+// It surfaces the Android 11+ wireless-debugging flow HONESTLY: the user enables
+// Wireless debugging on the phone once, FluxBridge auto-discovers it via mDNS,
+// and the FIRST time the user must read the 6-digit pairing code off the phone
+// (shown under "Pair device with pairing code") and type it here. After that
+// first pairing, the device is remembered and future launches auto-reconnect.
+component WirelessDialog inherits Rectangle {
+    // The discovered devices to list (populated from `adb mdns services`).
+    in property <[DiscoveredDevice]> devices;
+    // A status / progress line (adb download progress, discovery, pairing, and
+    // connect results). Empty when there is nothing to show.
+    in property <string> status;
+    // Whether the status line should be styled as an error.
+    in property <bool> status-is-error: false;
+    // Whether a background action (scan / pair / connect) is in flight; disables
+    // the action buttons so the user cannot stack requests.
+    in property <bool> busy: false;
+    // The 6-digit pairing code the user typed (two-way bound to the LineEdit).
+    in-out property <string> pairing-code;
+
+    // Rescan the LAN for wireless-debugging devices.
+    callback scan-devices();
+    // Pair a NEW device with the typed 6-digit code, then connect it. `id` is
+    // the selected device's identifier.
+    callback pair-and-connect(string, string);
+    // Connect an ALREADY-paired device (no code needed). `id` is its identifier.
+    callback connect-device(string);
+    // Close the panel.
+    callback close();
+
+    background: #202124;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #3c4043;
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: "Connect over Wi-Fi";
+            font-size: 16px;
+            font-weight: 700;
+            color: white;
+        }
+
+        Text {
+            text: "On the phone, enable Settings > Developer options > Wireless debugging and keep it on the same Wi-Fi as this PC. The FIRST time, open 'Pair device with pairing code' and type the 6-digit code below. After that, FluxBridge reconnects automatically.";
+            wrap: word-wrap;
+            color: #9aa0a6;
+            font-size: 12px;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "Scan for devices";
+                enabled: !root.busy;
+                clicked => {
+                    root.scan-devices();
+                }
+            }
+        }
+
+        // Discovered-device list. Each row has the device label and a Connect
+        // action for an already-paired device.
+        Text {
+            text: "Discovered devices";
+            color: #e8eaed;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 90px;
+            background: #17181a;
+            border-radius: 4px;
+            ListView {
+                for device in root.devices: Rectangle {
+                    height: 36px;
+                    HorizontalBox {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        alignment: space-between;
+                        Text {
+                            text: device.label;
+                            color: #e8eaed;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Connect";
+                            enabled: !root.busy;
+                            clicked => {
+                                root.connect-device(device.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if root.devices.length == 0: Text {
+            text: "No devices yet. Enable Wireless debugging on the phone, then Scan.";
+            color: #5f6368;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        // One-time pairing row: 6-digit code + Pair & connect. Pairs the FIRST
+        // discovered pairing endpoint (or the single discovered device).
+        Text {
+            text: "First time? Enter the 6-digit pairing code from the phone:";
+            color: #e8eaed;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        HorizontalBox {
+            spacing: 8px;
+            alignment: start;
+            code-input := LineEdit {
+                placeholder-text: "123456";
+                text <=> root.pairing-code;
+                width: 120px;
+            }
+            Button {
+                text: "Pair & connect";
+                primary: true;
+                enabled: !root.busy;
+                clicked => {
+                    root.pair-and-connect(root.pairing-code, root.devices.length > 0 ? root.devices[0].id : "");
+                }
+            }
+        }
+
+        // Status / progress line.
+        if root.status != "": Text {
+            text: root.status;
+            wrap: word-wrap;
+            color: root.status-is-error ? #f28b82 : #81c995;
+        }
+
+        HorizontalBox {
+            alignment: end;
+            Button {
+                text: "Close";
+                clicked => {
+                    root.close();
+                }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "FluxBridge";
     preferred-width: 960px;
@@ -178,6 +347,13 @@ export component MainWindow inherits Window {
     // Whether the help panel is visible, and the help body text (from ui.rs).
     in property <bool> help-visible: false;
     in property <string> help-text;
+    // Wireless discovery / pairing panel state, forwarded to the WirelessDialog.
+    in property <bool> wireless-visible: false;
+    in property <[DiscoveredDevice]> wireless-devices;
+    in property <string> wireless-status;
+    in property <bool> wireless-status-is-error: false;
+    in property <bool> wireless-busy: false;
+    in-out property <string> wireless-pairing-code;
     // Whether the landing / start menu is visible. Shown on launch; hidden once
     // the user clicks Start to begin mirroring.
     in property <bool> menu-visible: true;
@@ -196,6 +372,12 @@ export component MainWindow inherits Window {
     // Help panel callbacks: open/toggle from the Help button, close from the panel.
     callback help-toggle();
     callback help-close();
+    // Wireless panel callbacks, wired in src/ui.rs.
+    callback wireless-toggle();
+    callback wireless-close();
+    callback wireless-scan();
+    callback wireless-pair-and-connect(string, string);
+    callback wireless-connect-device(string);
     // Start-menu callbacks, wired in src/ui.rs.
     callback start();
     callback quit();
@@ -334,6 +516,12 @@ export component MainWindow inherits Window {
                     }
                 }
                 Button {
+                    text: "Connect wirelessly";
+                    clicked => {
+                        root.wireless-toggle();
+                    }
+                }
+                Button {
                     text: "Check for updates";
                     clicked => {
                         root.check-for-updates();
@@ -364,6 +552,32 @@ export component MainWindow inherits Window {
         body: root.help-text;
         close => {
             root.help-close();
+        }
+    }
+
+    // Wireless discovery / pairing panel, centered over the window when opened
+    // from the Start menu's "Connect wirelessly" button.
+    if root.wireless-visible: WirelessDialog {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(560px, parent.width - 32px);
+        height: min(520px, parent.height - 32px);
+        devices: root.wireless-devices;
+        status: root.wireless-status;
+        status-is-error: root.wireless-status-is-error;
+        busy: root.wireless-busy;
+        pairing-code <=> root.wireless-pairing-code;
+        scan-devices => {
+            root.wireless-scan();
+        }
+        pair-and-connect(code, id) => {
+            root.wireless-pair-and-connect(code, id);
+        }
+        connect-device(id) => {
+            root.wireless-connect-device(id);
+        }
+        close => {
+            root.wireless-close();
         }
     }
 
