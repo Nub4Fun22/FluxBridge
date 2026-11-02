@@ -52,6 +52,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
 
+      # 3b. Derive the release version from the pushed tag and expose it to the
+      #     build. github.ref_name is the tag (for example v0.4.0); the leading
+      #     `v` is stripped so the value is a bare SemVer (0.4.0). build.rs reads
+      #     FLUXBRIDGE_RELEASE_VERSION and re-emits it as FLUXBRIDGE_BUILD_VERSION,
+      #     which src/main.rs prefers over CARGO_PKG_VERSION. This makes the
+      #     shipped binary report exactly the tag it was built at, so the updater
+      #     never re-offers an already-installed release (the infinite-loop fix)
+      #     even if the workspace version in Cargo.toml was not bumped.
+      - name: Derive release version from tag
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          "FLUXBRIDGE_RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # 4. Build the optimized production binary.
       #    LTO and stripped debug symbols come from [profile.release] in the
       #    workspace Cargo.toml (lto=true, codegen-units=1, strip=true,
@@ -60,6 +74,8 @@ jobs:
       #    release build MUST enable it to produce the actual windowed client.
       #    build.rs embeds assets/icon.ico into the .exe on Windows via the
       #    Windows-only `embed-resource` build dependency.
+      #    FLUXBRIDGE_RELEASE_VERSION (set in the previous step) flows into
+      #    build.rs so the binary self-reports the tag version.
       #
       #    For v1 this builds `--features gui` and intentionally does NOT enable
       #    `decode`. The real FFmpeg H.264 decode path (the `decode` feature,

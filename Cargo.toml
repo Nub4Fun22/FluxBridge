@@ -15,7 +15,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 authors = ["FluxBridge contributors"]
@@ -50,8 +50,8 @@ panic = "abort"
 thiserror = "1"
 byteorder = "1"
 bitflags = "2"
-fluxbridge-core = { path = "crates/core", version = "0.1.0" }
-fluxbridge-updater = { path = "crates/updater", version = "0.1.0" }
+fluxbridge-core = { path = "crates/core", version = "0.4.0" }
+fluxbridge-updater = { path = "crates/updater", version = "0.4.0" }
 # HTTP for the updater: ureq uses rustls (pure Rust), so nothing links to the
 # system OpenSSL, which is not guaranteed on the headless Linux host.
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
