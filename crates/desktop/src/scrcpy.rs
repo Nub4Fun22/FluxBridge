@@ -263,6 +263,108 @@ pub fn consume_dummy_byte<R: Read>(r: &mut R) -> io::Result<()> {
     Ok(())
 }
 
+/// The outcome of a single attempt to read the tunnel-forward dummy byte.
+///
+/// This classifies what a one-byte read saw so a retry loop can tell apart a
+/// transient not-yet-ready condition (worth retrying) from a real failure:
+///
+/// * [`DummyByteRead::Byte`] - exactly one byte arrived; the dummy byte was
+///   consumed and the next read sees the first metadata header byte.
+/// * [`DummyByteRead::WouldBlock`] - the read would block (the socket has a
+///   read timeout and nothing arrived yet); retry.
+/// * [`DummyByteRead::Eof`] - the stream returned 0 bytes. In tunnel-forward
+///   mode this happens when `adb forward` accepts the local connection before
+///   the device-side server is listening, so an early EOF is the readiness race
+///   and is retryable up to the caller's bound.
+/// * [`DummyByteRead::Err`] - any other I/O error; not retryable.
+#[derive(Debug)]
+pub enum DummyByteRead {
+    /// One dummy byte was read and discarded.
+    Byte,
+    /// The read would block; nothing available yet.
+    WouldBlock,
+    /// The stream returned end-of-file (0 bytes) before the dummy byte.
+    Eof,
+    /// A non-retryable I/O error occurred.
+    Err(io::Error),
+}
+
+impl DummyByteRead {
+    /// Whether this outcome is a transient not-yet-ready condition the caller
+    /// should retry (an early EOF or a would-block), as opposed to success or a
+    /// hard error.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, DummyByteRead::Eof | DummyByteRead::WouldBlock)
+    }
+}
+
+/// Attempt to consume the leading tunnel-forward dummy byte ONCE, classifying
+/// the result for a retry loop.
+///
+/// Unlike [`consume_dummy_byte`] (which maps an early EOF to an
+/// `UnexpectedEof` error, surfacing as "failed to fill whole buffer"), this
+/// does a single `read` of one byte and reports whether a byte arrived, the
+/// read would block, the stream is at EOF, or a hard error occurred. On
+/// [`DummyByteRead::Byte`] EXACTLY one byte is consumed, so the next read sees
+/// the first byte of the scrcpy metadata header (no off-by-one). The retry
+/// policy (how many attempts, the backoff, and the cancel/sleep seams) lives in
+/// the caller so this stays a pure, synchronous, socket-free seam that is
+/// driven in tests by any [`Read`].
+pub fn try_consume_dummy_byte<R: Read>(r: &mut R) -> DummyByteRead {
+    let mut one = [0u8; 1];
+    match r.read(&mut one) {
+        Ok(0) => DummyByteRead::Eof,
+        Ok(_) => DummyByteRead::Byte,
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => DummyByteRead::WouldBlock,
+        Err(ref e) if e.kind() == io::ErrorKind::TimedOut => DummyByteRead::WouldBlock,
+        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => DummyByteRead::WouldBlock,
+        Err(e) => DummyByteRead::Err(e),
+    }
+}
+
+/// Consume the leading tunnel-forward dummy byte, retrying over a [`Read`] seam
+/// when the server is not ready yet.
+///
+/// scrcpy's own forward-mode client retries the local connect/read because
+/// `adb forward` can accept the desktop-side connection before the device-side
+/// server has started writing, so the first read may see an early EOF or a
+/// would-block. This mirrors that: it calls [`try_consume_dummy_byte`] up to
+/// `attempts` times, and between retryable outcomes ([`DummyByteRead::Eof`] /
+/// [`DummyByteRead::WouldBlock`]) it invokes `between_attempts` (the caller's
+/// backoff-and-cancel seam). `between_attempts` returns `false` to abort early
+/// (for example on a per-run cancel), which produces an error immediately.
+///
+/// Returns `Ok(())` once a byte arrives (exactly one byte consumed, so the next
+/// read sees the first header byte), and an [`io::Error`] after the attempts are
+/// exhausted, on a hard I/O error, or when `between_attempts` asks to stop. The
+/// sleep/cancel decision is entirely in `between_attempts`, so tests drive this
+/// with no real time passing and no socket.
+pub fn consume_dummy_byte_retrying<R: Read>(
+    r: &mut R,
+    attempts: u32,
+    mut between_attempts: impl FnMut() -> bool,
+) -> io::Result<()> {
+    let attempts = attempts.max(1);
+    let mut last_kind = io::ErrorKind::UnexpectedEof;
+    for attempt in 0..attempts {
+        match try_consume_dummy_byte(r) {
+            DummyByteRead::Byte => return Ok(()),
+            DummyByteRead::Eof => last_kind = io::ErrorKind::UnexpectedEof,
+            DummyByteRead::WouldBlock => last_kind = io::ErrorKind::WouldBlock,
+            DummyByteRead::Err(e) => return Err(e),
+        }
+        // Do not sleep after the final attempt; and honor an early abort
+        // (cancel) from the caller's seam.
+        if attempt + 1 < attempts && !between_attempts() {
+            break;
+        }
+    }
+    Err(io::Error::new(
+        last_kind,
+        "scrcpy server did not send the dummy byte before the forward-mode timeout",
+    ))
+}
+
 /// Drive a [`VideoDecoder`] from a scrcpy video stream, emitting decoded frames.
 ///
 /// Given any [`Read`] that yields a scrcpy video stream (optionally preceded by
@@ -878,6 +980,145 @@ mod tests {
         let mut rest = [0u8; 2];
         cursor.read_exact(&mut rest).unwrap();
         assert_eq!(rest, [0xAA, 0xBB]);
+    }
+
+    /// A [`Read`] seam that returns an early EOF (0 bytes) or a would-block the
+    /// first `stall` times, then yields `ready` bytes. Models the forward-mode
+    /// readiness race: `adb forward` accepts the local connection before the
+    /// device-side scrcpy server starts writing, so the first reads see no data.
+    struct StallingRead {
+        stall: usize,
+        would_block: bool,
+        ready: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl StallingRead {
+        fn eof_then(stall: usize, ready: Vec<u8>) -> Self {
+            StallingRead {
+                stall,
+                would_block: false,
+                ready: std::io::Cursor::new(ready),
+            }
+        }
+        fn would_block_then(stall: usize, ready: Vec<u8>) -> Self {
+            StallingRead {
+                stall,
+                would_block: true,
+                ready: std::io::Cursor::new(ready),
+            }
+        }
+    }
+
+    impl Read for StallingRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.stall > 0 {
+                self.stall -= 1;
+                if self.would_block {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "not ready"));
+                }
+                return Ok(0); // early EOF
+            }
+            self.ready.read(buf)
+        }
+    }
+
+    #[test]
+    fn try_consume_dummy_byte_classifies_outcomes() {
+        // A real byte.
+        let mut ok = std::io::Cursor::new(vec![0x00u8, 0xAA]);
+        assert!(matches!(
+            try_consume_dummy_byte(&mut ok),
+            DummyByteRead::Byte
+        ));
+        // Immediate EOF.
+        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
+        let r = try_consume_dummy_byte(&mut eof);
+        assert!(matches!(r, DummyByteRead::Eof));
+        assert!(r.is_retryable());
+        // Would-block maps to a retryable outcome.
+        struct WouldBlock;
+        impl Read for WouldBlock {
+            fn read(&mut self, _b: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "nope"))
+            }
+        }
+        let mut wb = WouldBlock;
+        assert!(try_consume_dummy_byte(&mut wb).is_retryable());
+    }
+
+    #[test]
+    fn consume_dummy_byte_retrying_succeeds_after_k_eofs_without_off_by_one() {
+        // The stream reports EOF twice (the forward-mode race), then yields the
+        // dummy byte followed by the first header bytes. The retry must succeed
+        // on the third attempt and consume EXACTLY the dummy byte, so the next
+        // read sees the first header byte (0xAA), not a shifted stream.
+        let mut stream = StallingRead::eof_then(2, vec![0x00, 0xAA, 0xBB, 0xCC]);
+        let mut attempts_between = 0;
+        consume_dummy_byte_retrying(&mut stream, 5, || {
+            attempts_between += 1;
+            true
+        })
+        .expect("retry succeeds once the dummy byte arrives");
+        // Exactly the two stalls were waited on between attempts.
+        assert_eq!(attempts_between, 2);
+        // The next read sees the first header byte, proving no off-by-one.
+        let mut next = [0u8; 3];
+        stream.read_exact(&mut next).unwrap();
+        assert_eq!(next, [0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn consume_dummy_byte_retrying_succeeds_after_would_blocks() {
+        let mut stream = StallingRead::would_block_then(3, vec![0x00, 0x11]);
+        consume_dummy_byte_retrying(&mut stream, 8, || true)
+            .expect("would-block is retried then the byte arrives");
+        let mut next = [0u8; 1];
+        stream.read_exact(&mut next).unwrap();
+        assert_eq!(next, [0x11]);
+    }
+
+    #[test]
+    fn consume_dummy_byte_retrying_gives_up_after_bound_on_persistent_eof() {
+        // EOF never clears within the attempt bound.
+        let mut stream = StallingRead::eof_then(100, vec![0x00]);
+        let mut waits = 0;
+        let err = consume_dummy_byte_retrying(&mut stream, 4, || {
+            waits += 1;
+            true
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // 4 attempts means 3 waits between them (no sleep after the last).
+        assert_eq!(waits, 3);
+    }
+
+    #[test]
+    fn consume_dummy_byte_retrying_aborts_promptly_on_cancel() {
+        // The between-attempts seam returns false (a per-run cancel); the loop
+        // must stop without exhausting the full attempt bound.
+        let mut stream = StallingRead::eof_then(100, vec![0x00]);
+        let mut waits = 0;
+        let err = consume_dummy_byte_retrying(&mut stream, 50, || {
+            waits += 1;
+            false // cancel requested
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // Only the first wait ran before the cancel broke the loop.
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn consume_dummy_byte_retrying_propagates_hard_error() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _b: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset"))
+            }
+        }
+        let mut stream = Broken;
+        let err = consume_dummy_byte_retrying(&mut stream, 5, || true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[test]

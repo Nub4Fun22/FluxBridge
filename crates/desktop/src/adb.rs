@@ -35,7 +35,7 @@
 //! shipped server.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 /// The scrcpy server version the client is written against.
 ///
@@ -598,6 +598,28 @@ impl AdbCommand {
     pub fn spawn(&self, args: &[String]) -> Result<Child, AdbError> {
         Command::new(&self.adb_path)
             .args(args)
+            .spawn()
+            .map_err(AdbError::Io)
+    }
+
+    /// Spawn adb with `args` capturing the child's stdout AND stderr as pipes,
+    /// returning the child without waiting.
+    ///
+    /// This is used for the long-lived scrcpy server launch. The scrcpy server
+    /// logs to stderr (a version mismatch, an `app_process` failure, an
+    /// unsupported option, or a Java stack trace all print there), and some
+    /// messages may go to stdout, so both are piped. With the default
+    /// [`AdbCommand::spawn`] the child inherits the parent's stdio and that
+    /// output goes nowhere, which is exactly why a server that dies at startup
+    /// surfaces only the opaque "dummy byte: failed to fill whole buffer" read
+    /// error. The caller is responsible for draining the pipes on a background
+    /// thread so a chatty or silent server never blocks the pipeline (see
+    /// [`crate::pipeline`]).
+    pub fn spawn_capturing(&self, args: &[String]) -> Result<Child, AdbError> {
+        Command::new(&self.adb_path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(AdbError::Io)
     }
@@ -1290,6 +1312,38 @@ mod tests {
                 "control=true",
             ]
         );
+    }
+
+    /// The client's pinned [`SCRCPY_SERVER_VERSION`] MUST be exactly the first
+    /// positional argument emitted after the server class name by
+    /// [`server_launch_args`]. scrcpy aborts instantly if the version string in
+    /// the launch command does not match the jar it was built from, which
+    /// manifests downstream as an immediate EOF on the video socket (the
+    /// "dummy byte: failed to fill whole buffer" failure). Locking them
+    /// together here means the pinned constant and the launch command can never
+    /// silently diverge. (The workflow side of the version agreement, that the
+    /// downloaded jar is the matching v2.4 upstream asset, is covered in the
+    /// release workflow.)
+    #[test]
+    fn server_launch_args_version_is_first_positional_after_class() {
+        for sel in [
+            DeviceSelector::UsbDefault,
+            DeviceSelector::Serial("192.168.1.42:37000".into()),
+        ] {
+            let args = server_launch_args(&sel, &ServerLaunchOptions::default());
+            let class_pos = args
+                .iter()
+                .position(|a| a == SCRCPY_SERVER_CLASS)
+                .expect("the launch command names the scrcpy server class");
+            let version = args
+                .get(class_pos + 1)
+                .expect("a positional argument follows the server class");
+            assert_eq!(
+                version, SCRCPY_SERVER_VERSION,
+                "the first positional after the server class must be the pinned \
+                 SCRCPY_SERVER_VERSION so the client and jar versions cannot diverge"
+            );
+        }
     }
 
     #[test]
