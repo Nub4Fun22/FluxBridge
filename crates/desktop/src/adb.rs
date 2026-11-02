@@ -530,8 +530,14 @@ impl AdbCommand {
                 stderr: stdout.trim().to_string(),
             });
         }
-        // No explicit success/failure marker but a zero exit: trust the exit
-        // code (run() already rejected non-zero exits).
+        // No explicit success/failure marker in stdout. We deliberately TRUST
+        // adb's zero exit code here and report success: `run()` already rejected
+        // every non-zero exit, so reaching this point means adb itself
+        // considered the pair command successful. The assumption is that a
+        // genuine pairing failure either exits non-zero or prints a
+        // `failed`/`error` marker (both handled above); a locale or future adb
+        // wording that exits zero yet omits the "successfully paired" marker
+        // would fall through here and be treated as paired.
         Ok(())
     }
 

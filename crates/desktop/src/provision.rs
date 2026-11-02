@@ -225,11 +225,14 @@ pub fn extract_platform_tools<R: Read + Seek>(
 /// 1. If `<data_dir>/platform-tools/adb[.exe]` already exists it is returned
 ///    immediately, so the download happens at most once (and `transport` is not
 ///    touched on subsequent runs).
-/// 2. Otherwise the platform-tools zip is downloaded to a temp file via the
-///    injected [`HttpTransport`] (reporting [`ProvisionProgress::Downloading`]),
-///    then extracted into `data_dir` (reporting [`ProvisionProgress::Extracting`]),
-///    and the resolved adb path is returned (reporting
-///    [`ProvisionProgress::Done`]).
+/// 2. Otherwise the platform-tools zip is downloaded into a private staging
+///    directory via the injected [`HttpTransport`] (reporting
+///    [`ProvisionProgress::Downloading`]), extracted there (reporting
+///    [`ProvisionProgress::Extracting`]), and only once the FULL extract
+///    succeeded is the staged `platform-tools/` renamed into its final place
+///    under `data_dir`. The staging directory (including the downloaded zip) is
+///    removed on every exit path, so a crash or failure mid-extract can never
+///    leave a half-written `platform-tools/` that a later run would trust.
 ///
 /// The transport is injected (the production caller passes the updater's
 /// `UreqTransport`), so this is unit-tested fully offline with a fake transport
@@ -241,17 +244,26 @@ pub fn ensure_adb(
     progress: &mut dyn FnMut(ProvisionProgress),
 ) -> Result<PathBuf, ProvisionError> {
     // 1. Already provisioned: short-circuit without any network access.
-    let existing = provisioned_adb_path(data_dir);
-    if existing.is_file() {
-        progress(ProvisionProgress::Done(existing.clone()));
-        return Ok(existing);
+    //    The install is written atomically (see below), so the presence of the
+    //    adb file implies its platform-tools siblings landed too; this check is
+    //    therefore a trustworthy "complete install" signal.
+    let final_adb = provisioned_adb_path(data_dir);
+    if final_adb.is_file() {
+        progress(ProvisionProgress::Done(final_adb.clone()));
+        return Ok(final_adb);
     }
 
     std::fs::create_dir_all(data_dir)?;
 
-    // 2. Download the official zip to a temp file next to the data dir, so the
-    //    partial download never shadows the final platform-tools location.
-    let zip_path = data_dir.join("platform-tools-download.zip");
+    // A private staging directory (unique per process) that everything is
+    // downloaded into and extracted under. It is cleaned up on EVERY exit path
+    // via the `StagingDir` guard, so a partial download or partial extract
+    // never leaves an artifact behind, and the final `platform-tools/` only
+    // ever appears as the result of a complete, successful extract.
+    let staging = StagingDir::new(data_dir.join(format!(".staging-{}", std::process::id())))?;
+
+    // 2. Download the official zip into the staging directory.
+    let zip_path = staging.path().join("platform-tools-download.zip");
     {
         let mut on_byte = |pct: u8| progress(ProvisionProgress::Downloading(pct));
         transport
@@ -259,24 +271,63 @@ pub fn ensure_adb(
             .map_err(|e| ProvisionError::Http(e.to_string()))?;
     }
 
-    // 3. Extract into the data dir.
+    // 3. Extract into the staging directory, producing
+    //    `<staging>/platform-tools/`.
     progress(ProvisionProgress::Extracting);
     let file = std::fs::File::open(&zip_path)?;
-    let adb_path = extract_platform_tools(file, data_dir)?;
+    let staged_adb = extract_platform_tools(file, staging.path())?;
 
-    // The archive is no longer needed once extracted; a failure to remove it is
-    // not fatal to provisioning.
-    let _ = std::fs::remove_file(&zip_path);
+    // 4. Atomically move the fully extracted `platform-tools/` into its final
+    //    place. Only after this does the short-circuit in step 1 see an install.
+    let staged_platform_tools = staging.path().join("platform-tools");
+    let final_platform_tools = data_dir.join("platform-tools");
+    // A stale/partial `platform-tools` could exist from an older pre-atomic run;
+    // clear it so the rename lands on a clean target.
+    let _ = std::fs::remove_dir_all(&final_platform_tools);
+    std::fs::rename(&staged_platform_tools, &final_platform_tools)?;
+    debug_assert!(staged_adb.starts_with(staging.path()));
 
-    progress(ProvisionProgress::Done(adb_path.clone()));
-    Ok(adb_path)
+    // The staging guard drops here, removing the (now empty) staging dir and the
+    // downloaded zip.
+    drop(staging);
+
+    progress(ProvisionProgress::Done(final_adb.clone()));
+    Ok(final_adb)
+}
+
+/// RAII guard for the provisioning staging directory: creates it on
+/// construction and recursively removes it on drop, so the downloaded zip and
+/// any partially extracted tree are cleaned up on every exit path (success,
+/// early `?` return, or panic).
+struct StagingDir {
+    path: PathBuf,
+}
+
+impl StagingDir {
+    fn new(path: PathBuf) -> Result<Self, ProvisionError> {
+        // Start from a clean slate in case a previous run was killed before its
+        // own guard could run.
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)?;
+        Ok(StagingDir { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Build a synthetic platform-tools-shaped zip in memory: a
     /// `platform-tools/adb[.exe]` entry plus a sibling file, so extraction can
@@ -307,21 +358,21 @@ mod tests {
     /// short-circuits without re-downloading.
     struct FakeZipTransport {
         bytes: Vec<u8>,
-        download_calls: RefCell<u32>,
+        download_calls: AtomicU32,
     }
 
     impl FakeZipTransport {
         fn new(bytes: Vec<u8>) -> Self {
             FakeZipTransport {
                 bytes,
-                download_calls: RefCell::new(0),
+                download_calls: AtomicU32::new(0),
             }
         }
-    }
 
-    // The real transport is Send + Sync; ensure_adb only needs a shared
-    // reference and our test is single-threaded, so the RefCell is safe here.
-    unsafe impl Sync for FakeZipTransport {}
+        fn download_calls(&self) -> u32 {
+            self.download_calls.load(Ordering::SeqCst)
+        }
+    }
 
     impl HttpTransport for FakeZipTransport {
         fn get_text(&self, _url: &str) -> Result<String, fluxbridge_updater::UpdaterError> {
@@ -334,7 +385,7 @@ mod tests {
             dest: &Path,
             progress: &mut fluxbridge_updater::ProgressCallback<'_>,
         ) -> Result<(), fluxbridge_updater::UpdaterError> {
-            *self.download_calls.borrow_mut() += 1;
+            self.download_calls.fetch_add(1, Ordering::SeqCst);
             progress(0);
             std::fs::write(dest, &self.bytes)?;
             progress(100);
@@ -417,7 +468,7 @@ mod tests {
         let adb_path = ensure_adb(&data_dir, &transport, &mut |p| events.push(p)).unwrap();
         assert!(adb_path.is_file(), "adb should exist after provisioning");
         assert_eq!(adb_path, provisioned_adb_path(&data_dir));
-        assert_eq!(*transport.download_calls.borrow(), 1, "first call downloads");
+        assert_eq!(transport.download_calls(), 1, "first call downloads");
         assert!(
             events.iter().any(|e| matches!(e, ProvisionProgress::Downloading(_))),
             "a Downloading progress event should be reported: {events:?}"
@@ -432,10 +483,86 @@ mod tests {
         let adb_path2 = ensure_adb(&data_dir, &transport, &mut |_| {}).unwrap();
         assert_eq!(adb_path2, adb_path);
         assert_eq!(
-            *transport.download_calls.borrow(),
+            transport.download_calls(),
             1,
             "second call must not re-download"
         );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn ensure_adb_installs_siblings_and_leaves_no_staging_or_zip() {
+        let transport = FakeZipTransport::new(synthetic_platform_tools_zip());
+        let data_dir = std::env::temp_dir().join(format!(
+            "fluxbridge-ensure-atomic-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        let adb_path = ensure_adb(&data_dir, &transport, &mut |_| {}).unwrap();
+
+        // The full install (adb AND its sibling) landed under the FINAL path,
+        // not a staging dir, so the short-circuit can trust the adb file.
+        assert_eq!(adb_path, provisioned_adb_path(&data_dir));
+        assert!(adb_path.is_file(), "adb should exist at the final path");
+        let sibling = data_dir.join("platform-tools").join("NOTICE.txt");
+        assert!(sibling.is_file(), "sibling must be installed alongside adb");
+
+        // No staging directory and no downloaded zip are left behind anywhere
+        // under the data dir.
+        for entry in std::fs::read_dir(&data_dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".staging-"),
+                "staging dir must be cleaned up, found {name}"
+            );
+            assert!(
+                !name.ends_with(".zip"),
+                "downloaded zip must be cleaned up, found {name}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn ensure_adb_failed_extract_leaves_no_partial_install_or_zip() {
+        // A transport that serves bytes that are NOT a valid zip, so extraction
+        // fails after a successful "download".
+        let transport = FakeZipTransport::new(b"this is not a zip archive".to_vec());
+        let data_dir = std::env::temp_dir().join(format!(
+            "fluxbridge-ensure-fail-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        let result = ensure_adb(&data_dir, &transport, &mut |_| {});
+        assert!(result.is_err(), "a corrupt archive must fail provisioning");
+        assert_eq!(transport.download_calls(), 1, "the download was attempted");
+
+        // The failed extract must NOT leave a (partial) platform-tools install
+        // that a later run would short-circuit onto, and must NOT leave the
+        // downloaded zip or the staging dir behind.
+        assert!(
+            !data_dir.join("platform-tools").exists(),
+            "no platform-tools/ must be left after a failed extract"
+        );
+        if data_dir.exists() {
+            for entry in std::fs::read_dir(&data_dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.starts_with(".staging-"),
+                    "staging dir must be cleaned up on failure, found {name}"
+                );
+                assert!(
+                    !name.ends_with(".zip"),
+                    "downloaded zip must be cleaned up on failure, found {name}"
+                );
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
