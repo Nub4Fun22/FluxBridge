@@ -21,7 +21,7 @@
 #define AppName "FluxBridge"
 #define AppPublisher "FluxBridge contributors"
 #define AppExeName "fluxbridge-desktop.exe"
-#define AppUrl "https://github.com/fluxbridge/fluxbridge"
+#define AppUrl "https://github.com/Nub4Fun22/FluxBridge"
 
 ; ---------------------------------------------------------------------------
 ; [Setup]
