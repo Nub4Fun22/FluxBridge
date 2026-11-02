@@ -21,6 +21,69 @@ use fluxbridge_updater::{GithubUpdater, UreqTransport};
 use crate::connection::ConnectionConfig;
 use crate::updater_ui::{run_update, UpdateEvent};
 
+/// The in-app help / "how to connect" guide shown by the Help panel.
+///
+/// Kept accurate to what FluxBridge actually supports: Android via ADB (USB and
+/// Wi-Fi) with an mDNS auto-pairing path planned, and iOS within Apple's
+/// ecosystem limits (AirPlay/mDNS mirroring, libimobiledevice/WebDriverAgent).
+/// See `docs/IOS_STRATEGY.md`, `android-server/README.md` and the root README.
+const HELP_TEXT: &str = "\
+FluxBridge mirrors and controls your phone from this PC. Pick your platform below.
+
+WHAT YOU NEED (all platforms)
+- This FluxBridge desktop client (you are running it).
+- The phone and PC reachable over USB or the same local Wi-Fi network.
+- The FluxBridge device-side server running on the phone (see Android below).
+- Default connection target: 127.0.0.1:27183. You can override it by passing a
+  host:port argument when launching the client.
+
+ANDROID (recommended, full control)
+Requirements:
+- Android phone with Developer Options and USB debugging enabled.
+  Enable them in Settings > About phone > tap Build number 7 times, then
+  Settings > System > Developer options > USB debugging.
+- ADB (Android Debug Bridge) installed on the PC (part of the Android platform
+  tools). The first USB connection prompts you on the phone to Allow / authorize
+  this computer for USB debugging; accept it.
+- The FluxBridge Android capture server pushed to the device (it runs via
+  app_process under the shell UID, so there is no app to install).
+
+Connect over USB:
+1. Plug the phone into the PC with a USB cable and authorize the prompt.
+2. Push the server and forward the port, then launch it:
+     adb push fluxbridge-server.jar /data/local/tmp/
+     adb forward tcp:27183 tcp:27183
+     adb shell CLASSPATH=/data/local/tmp/fluxbridge-server.jar \\
+         app_process / com.fluxbridge.server.Server 27183
+3. Start FluxBridge; it dials 127.0.0.1:27183, which ADB tunnels to the phone.
+
+Connect over Wi-Fi:
+1. With the phone on USB once, switch ADB to TCP/IP and find the phone's IP:
+     adb tcpip 5555
+     adb shell ip route        (note the wlan0 address, e.g. 192.168.1.42)
+2. Unplug, connect over the network, then push + forward + launch as above:
+     adb connect 192.168.1.42:5555
+     adb -s 192.168.1.42:5555 forward tcp:27183 tcp:27183
+Note: wireless mDNS auto-pairing (no manual adb connect) is planned; until then
+use the manual steps above.
+
+iOS / iPhone (mirroring-first, Apple ecosystem limits apply)
+Apple does not expose an ADB-style input-injection or free screen-capture API,
+so iOS support is more limited than Android:
+- Mirroring: FluxBridge acts as an AirPlay receiver discovered over mDNS /
+  Bonjour. Open Control Center on the iPhone, tap Screen Mirroring, and pick
+  FluxBridge; iOS streams the whole screen (full-screen only, no per-app view).
+  A wired libimobiledevice path over USB is a lower-latency fallback.
+- Control: synthesizing taps/swipes requires WebDriverAgent, a signed developer
+  app deployed over USB via libimobiledevice. Without it, iOS is mirroring only;
+  FluxBridge surfaces that state clearly.
+
+TROUBLESHOOTING
+- 'not started' / cannot connect: confirm the device-side server is running and
+  that adb forward tcp:27183 is active (USB) or the phone's IP is reachable (Wi-Fi).
+- Android unauthorized: re-check the Allow USB debugging prompt on the phone.
+- Wrong address: pass the correct host:port when launching the client.";
+
 /// Build the main window and wire the updater dialog.
 ///
 /// `update_events` carries messages from the startup check (and, once the user
@@ -33,6 +96,25 @@ pub fn build_main_window(
 ) -> Result<MainWindow, slint::PlatformError> {
     let window = MainWindow::new()?;
     window.set_connection_status(format!("Connecting to {}", config.address()).into());
+
+    // Seed the in-app help panel with the connection guide. It stays hidden
+    // until the user clicks the Help button.
+    window.set_help_text(HELP_TEXT.into());
+    window.set_help_visible(false);
+
+    // Help button toggles the panel; the panel's Close button hides it.
+    let weak = window.as_weak();
+    window.on_help_toggle(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_help_visible(!w.get_help_visible());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_help_close(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_help_visible(false);
+        }
+    });
 
     // A clonable sender so the accept worker can push progress back into the
     // same event stream the timer below drains.

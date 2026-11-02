@@ -89,6 +89,58 @@ component UpdateDialog inherits Rectangle {
     }
 }
 
+// In-app help / "how to connect" panel. Shown only when the user opens it from
+// the Help button in the MainWindow. Mirrors the UpdateDialog structure: a
+// title, a ScrollView wrapping the body text, and a single action button. The
+// body text is supplied from src/ui.rs (HELP_TEXT) so the copy lives next to
+// the Rust wiring and stays easy to keep accurate.
+component HelpDialog inherits Rectangle {
+    // The full help body (prerequisites + connection steps). Set from Rust.
+    in property <string> body;
+
+    // User closed the panel.
+    callback close();
+
+    background: #202124;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #3c4043;
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: "Help: how to connect a phone";
+            font-size: 16px;
+            font-weight: 700;
+            color: white;
+        }
+
+        // Scrollable guide. vertical-stretch lets it grow with the panel so the
+        // step-by-step instructions scroll instead of clipping.
+        ScrollView {
+            vertical-stretch: 1;
+            Text {
+                text: root.body;
+                wrap: word-wrap;
+                color: #e8eaed;
+            }
+        }
+
+        HorizontalBox {
+            alignment: end;
+            Button {
+                text: "Close";
+                primary: true;
+                clicked => {
+                    root.close();
+                }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "FluxBridge";
     preferred-width: 960px;
@@ -106,19 +158,36 @@ export component MainWindow inherits Window {
     in property <bool> update-downloading: false;
     in property <string> update-status;
     in property <bool> update-status-is-error: false;
+    // Whether the help panel is visible, and the help body text (from ui.rs).
+    in property <bool> help-visible: false;
+    in property <string> help-text;
 
     // Re-exported dialog callbacks so main.rs / updater_ui.rs can connect them.
     callback update-accept();
     callback update-dismiss();
+    // Help panel callbacks: open/toggle from the Help button, close from the panel.
+    callback help-toggle();
+    callback help-close();
 
     VerticalBox {
         padding: 12px;
         spacing: 8px;
 
-        Text {
-            text: root.connection-status;
-            color: #9aa0a6;
-            font-size: 13px;
+        // Top bar: connection status on the left, a Help button on the right.
+        HorizontalBox {
+            alignment: space-between;
+            Text {
+                text: root.connection-status;
+                color: #9aa0a6;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Help";
+                clicked => {
+                    root.help-toggle();
+                }
+            }
         }
 
         // Video surface placeholder. The decode loop will push DecodedFrame
@@ -133,6 +202,18 @@ export component MainWindow inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
+        }
+    }
+
+    // Help panel, centered over the window when opened from the Help button.
+    if root.help-visible: HelpDialog {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(640px, parent.width - 32px);
+        height: min(480px, parent.height - 32px);
+        body: root.help-text;
+        close => {
+            root.help-close();
         }
     }
 
