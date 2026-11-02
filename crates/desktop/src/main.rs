@@ -53,8 +53,30 @@ use fluxbridge_updater::{GithubUpdater, UreqTransport};
 use pipeline::{PipelineConfig, PipelineStatus};
 use updater_ui::{spawn_update_check, GITHUB_OWNER, GITHUB_REPO};
 
-/// The running application's version, from Cargo at build time.
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The running application's version.
+///
+/// Resolved with [`resolve_version`]: the release build (`build.rs`) stamps the
+/// git tag into `FLUXBRIDGE_BUILD_VERSION`, which takes precedence; otherwise we
+/// fall back to Cargo's `CARGO_PKG_VERSION`. This is what makes a binary built
+/// at tag vX.Y.Z honestly report X.Y.Z even if the workspace version in
+/// Cargo.toml was not bumped, so the updater never re-offers an installed
+/// release (the infinite-update-loop fix).
+const CURRENT_VERSION: &str = resolve_version();
+
+/// Pick the authoritative version string at compile time.
+///
+/// Precedence:
+/// 1. `FLUXBRIDGE_BUILD_VERSION` when present (emitted by `build.rs` from the
+///    release tag via `FLUXBRIDGE_RELEASE_VERSION`), so the shipped binary's
+///    self-reported version equals the tag that built it.
+/// 2. `CARGO_PKG_VERSION` otherwise (the default for every headless/developer
+///    build), so `cargo build`/`cargo test` on the host stay unaffected.
+const fn resolve_version() -> &'static str {
+    match option_env!("FLUXBRIDGE_BUILD_VERSION") {
+        Some(v) => v,
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
 
 /// Resolve the connection target from the first CLI argument, defaulting to the
 /// local adb-forward address.
@@ -208,9 +230,58 @@ fn start_pipeline(
     pipeline::run_pipeline(config, status)
 }
 
+/// Pure version-precedence logic, extracted so it is testable on the headless
+/// host without relying on compile-time environment macros.
+///
+/// Mirrors [`resolve_version`]: a present-and-non-empty build-stamped version
+/// (`FLUXBRIDGE_BUILD_VERSION`) wins over the Cargo package version. An absent
+/// or empty stamp falls back to the Cargo version.
+fn pick_version<'a>(build_version: Option<&'a str>, cargo_version: &'a str) -> &'a str {
+    match build_version {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => cargo_version,
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("fluxbridge-desktop error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn build_stamp_takes_precedence_over_cargo_version() {
+        // When build.rs stamped a release version, it must win so the shipped
+        // binary reports the tag it was built at (fixes the update loop even if
+        // Cargo.toml was not bumped).
+        assert_eq!(pick_version(Some("0.4.0"), "0.1.0"), "0.4.0");
+    }
+
+    #[test]
+    fn falls_back_to_cargo_version_when_no_stamp() {
+        // The default headless/developer build sets no stamp and must report
+        // CARGO_PKG_VERSION unchanged.
+        assert_eq!(pick_version(None, "0.4.0"), "0.4.0");
+    }
+
+    #[test]
+    fn empty_stamp_is_ignored() {
+        // A present-but-empty env var must not blank out the version.
+        assert_eq!(pick_version(Some(""), "0.4.0"), "0.4.0");
+        assert_eq!(pick_version(Some("   "), "0.4.0"), "0.4.0");
+    }
+
+    #[test]
+    fn resolve_version_matches_cargo_in_default_build() {
+        // With no FLUXBRIDGE_BUILD_VERSION set at compile time (the test build),
+        // resolve_version() must equal the Cargo package version, which is the
+        // bumped workspace version.
+        assert_eq!(resolve_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(resolve_version(), "0.4.0");
     }
 }

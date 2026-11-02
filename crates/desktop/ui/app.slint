@@ -45,6 +45,12 @@ component UpdateDialog inherits Rectangle {
     border-radius: 8px;
     border-width: 1px;
     border-color: #3c4043;
+    // Give the dialog a sensible fixed height so the VerticalBox has real
+    // vertical space to distribute: the stretch goes to the notes ScrollView
+    // (vertical-stretch: 1) while the title, progress bar and button row keep
+    // their natural height. Without this the box collapsed to the buttons'
+    // intrinsic size and stretched them into oversized blocks.
+    height: 300px;
 
     VerticalBox {
         padding: 16px;
@@ -57,12 +63,26 @@ component UpdateDialog inherits Rectangle {
             color: white;
         }
 
-        ScrollView {
-            height: 120px;
-            Text {
-                text: root.release-notes;
-                wrap: word-wrap;
-                color: #e8eaed;
+        // Scrollable release notes. Mirrors the known-good HelpDialog pattern:
+        // the ScrollView takes the leftover vertical space (vertical-stretch),
+        // its inner Text is wrapped in a VerticalLayout and given an explicit
+        // width (viewport width minus padding) so word-wrap computes correctly,
+        // and min-height reports the full wrapped height so long notes scroll
+        // instead of clipping.
+        notes-scroll := ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                Text {
+                    text: root.release-notes;
+                    wrap: word-wrap;
+                    color: #e8eaed;
+                    // Constrain the wrap width to the visible viewport minus a
+                    // little padding so lines wrap to the dialog, not to an
+                    // unbounded intrinsic width (which caused the clipping).
+                    width: notes-scroll.visible-width - 8px;
+                    min-height: self.preferred-height;
+                }
             }
         }
 
@@ -78,12 +98,18 @@ component UpdateDialog inherits Rectangle {
             color: root.status-is-error ? #f28b82 : #81c995;
         }
 
+        // Button row. vertical-stretch: 0 keeps it at its natural height so the
+        // leftover space goes to the notes ScrollView above, not here. Each
+        // button gets a fixed height so it renders as a normal-sized button
+        // rather than a block that stretches to fill the row.
         HorizontalBox {
             spacing: 8px;
+            vertical-stretch: 0;
             Button {
                 text: "Actualizeaza acum";
                 primary: true;
                 enabled: !root.downloading;
+                height: 32px;
                 clicked => {
                     root.accept();
                 }
@@ -91,6 +117,7 @@ component UpdateDialog inherits Rectangle {
             Button {
                 text: "Mai tarziu / Refuza";
                 enabled: !root.downloading;
+                height: 32px;
                 clicked => {
                     root.dismiss();
                 }
@@ -150,9 +177,11 @@ component HelpDialog inherits Rectangle {
 
         HorizontalBox {
             alignment: end;
+            vertical-stretch: 0;
             Button {
                 text: "Close";
                 primary: true;
+                height: 32px;
                 clicked => {
                     root.close();
                 }
