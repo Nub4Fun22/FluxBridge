@@ -41,6 +41,9 @@ mod updater_ui;
 #[cfg(feature = "gui")]
 mod ui;
 
+#[cfg(test)]
+mod test_env;
+
 use std::sync::mpsc;
 
 use connection::ConnectionConfig;

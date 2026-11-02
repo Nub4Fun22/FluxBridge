@@ -595,6 +595,7 @@ mod tests {
             std::env::set_var("PATH", "/nonexistent-path-xyz");
             std::env::remove_var("HOME");
             std::env::remove_var("LOCALAPPDATA");
+            std::env::remove_var("XDG_DATA_HOME");
             match locate_adb() {
                 Err(AdbError::NotFound { searched }) => {
                     assert!(
@@ -629,6 +630,7 @@ mod tests {
             std::env::set_var("PATH", "/nonexistent-path-xyz");
             std::env::remove_var("HOME");
             std::env::remove_var("LOCALAPPDATA");
+            std::env::remove_var("XDG_DATA_HOME");
             let found = locate_or_provisioned(&data_dir).expect("bundled adb should be found");
             assert_eq!(found, adb_path);
         });
@@ -637,23 +639,12 @@ mod tests {
     }
 
     /// Run `f` with a saved/restored snapshot of the env vars we mutate, so the
-    /// discovery test does not leak state into other tests. Serialized through a
-    /// mutex because env vars are process-global.
+    /// discovery test does not leak state into other tests. Delegates to the
+    /// crate-wide [`crate::test_env::with_env_lock`] so it serializes through
+    /// the SAME process-global lock as every other env-mutating desktop test
+    /// (env vars are process-global, so independent locks would race), and
+    /// saves/restores the full shared key set (including `XDG_DATA_HOME`).
     fn temp_env_clear(f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            ["ANDROID_HOME", "ANDROID_SDK_ROOT", "PATH", "HOME", "LOCALAPPDATA"]
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
+        crate::test_env::with_env_lock(f);
     }
 }

@@ -707,47 +707,37 @@ mod tests {
     /// PATH for the duration of the call.
     #[test]
     fn missing_adb_reports_error_through_channel() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Serialize through the crate-wide process-global env lock so this
+        // never races another env-mutating test (env vars are process-global;
+        // independent locks would not serialize against each other).
+        // `with_env_lock` saves/restores the full shared key set, so we only
+        // apply the mutations this test needs inside the closure.
+        //
+        // We strip the SDK vars and PATH so adb cannot be found, AND the vars
+        // `directories` uses to resolve the data dir (HOME / XDG_DATA_HOME on
+        // unix, LOCALAPPDATA on Windows) so `provision::data_dir()` returns
+        // None and the pipeline does NOT attempt a live platform-tools
+        // download from this headless host. We are asserting the
+        // offline-fallback path: no data dir -> the original NotFound guidance
+        // is surfaced.
+        let mut result = None;
+        let mut statuses: Vec<PipelineStatus> = Vec::new();
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var("ANDROID_HOME", "/nonexistent-sdk-xyz");
+            std::env::remove_var("ANDROID_SDK_ROOT");
+            std::env::set_var("PATH", "/nonexistent-path-xyz");
+            std::env::remove_var("HOME");
+            std::env::remove_var("LOCALAPPDATA");
+            std::env::remove_var("XDG_DATA_HOME");
 
-        // Also strip the vars `directories` uses to resolve the data dir
-        // (HOME / XDG_DATA_HOME on unix, LOCALAPPDATA on Windows) so
-        // `provision::data_dir()` returns None and the pipeline does NOT
-        // attempt a live platform-tools download from this headless host. We
-        // are asserting the offline-fallback path: no data dir -> the original
-        // NotFound guidance is surfaced.
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-            "ANDROID_HOME",
-            "ANDROID_SDK_ROOT",
-            "PATH",
-            "HOME",
-            "LOCALAPPDATA",
-            "XDG_DATA_HOME",
-        ]
-        .iter()
-        .map(|k| (*k, std::env::var_os(k)))
-        .collect();
-        std::env::set_var("ANDROID_HOME", "/nonexistent-sdk-xyz");
-        std::env::remove_var("ANDROID_SDK_ROOT");
-        std::env::set_var("PATH", "/nonexistent-path-xyz");
-        std::env::remove_var("HOME");
-        std::env::remove_var("LOCALAPPDATA");
-        std::env::remove_var("XDG_DATA_HOME");
+            let (tx, rx) = mpsc::channel();
+            let cfg = PipelineConfig::default();
+            result = Some(run_pipeline(&cfg, &tx));
+            statuses = rx.try_iter().collect();
+        });
 
-        let (tx, rx) = mpsc::channel();
-        let cfg = PipelineConfig::default();
-        let result = run_pipeline(&cfg, &tx);
-
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-
+        let result = result.expect("pipeline ran under the env lock");
         assert!(result.is_err(), "missing adb must return Err");
-        let statuses: Vec<PipelineStatus> = rx.try_iter().collect();
         assert!(
             matches!(statuses.last(), Some(PipelineStatus::Error(_))),
             "an Error status must be reported, got {statuses:?}"
