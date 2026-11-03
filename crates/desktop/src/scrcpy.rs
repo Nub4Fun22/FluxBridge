@@ -390,9 +390,10 @@ pub fn consume_dummy_byte_retrying<R: Read>(
 /// 1. consumes the dummy byte when `tunnel_forward` is true;
 /// 2. parses the one-shot [`VideoHeader`] and configures `decoder` with the
 ///    device resolution from it;
-/// 3. loops [`read_av_packet`], treating `is_config` access units as decoder
-///    configuration (SPS/PPS extradata) and every other access unit as a frame
-///    to decode;
+/// 3. loops [`read_av_packet`], delivering EVERY access unit (config and media
+///    alike) through [`VideoDecoder::decode_unit`] carrying the scrcpy
+///    `is_config`/`is_keyframe` flags, so the native engine can prepend the
+///    SPS/PPS config unit to the next media packet (scrcpy's `packet_merger`);
 /// 4. pushes each non-empty [`DecodedFrame`] onto `frame_sink`.
 ///
 /// It returns `Ok(header)` when the stream ends cleanly (so the caller can log
@@ -450,14 +451,14 @@ pub fn never_cancel() -> bool {
 /// `is_config`/`is_keyframe` flags:
 ///
 /// * `is_config` units carry SPS/PPS. They are delivered to the decoder as DATA
-///   through `decode_unit` with `is_config == true`, NOT dropped and NOT sent
-///   as a separate `configure()`-with-empty-dims call. scrcpy (MediaCodec)
-///   sends this codec config ONCE up front and does NOT repeat it before each
-///   keyframe, so dropping it here would leave the decoder with no context and
-///   the first real frame would fail. The decoder decides how the config unit
-///   is used: the native engine PREPENDS it to the next media packet via
-///   scrcpy's packet_merger, while the stub/ffmpeg-next decoders keep their
-///   historical behaviour via the trait's default `decode_unit`;
+///   through [`VideoDecoder::decode_unit`] with `is_config == true`, NOT dropped
+///   and NOT sent as a separate `configure()`-with-empty-dims call. scrcpy
+///   (MediaCodec) sends this codec config ONCE up front and does NOT repeat it
+///   before each keyframe, so dropping it here would leave the decoder with no
+///   context and the first real frame would fail. The decoder decides how the
+///   config unit is used: the native engine PREPENDS it to the next media
+///   packet via scrcpy's `packet_merger`, while the stub/ffmpeg-next decoders
+///   keep their historical behaviour via the trait's default `decode_unit`;
 /// * every other unit is decoded and, if the decoder produced drawable pixels
 ///   (a non-empty buffer), forwarded to `frame_sink`.
 ///

@@ -66,7 +66,7 @@ jobs:
           $version = "${{ github.ref_name }}" -replace '^v', ''
           "FLUXBRIDGE_RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # 3c. Provision a prebuilt SHARED FFmpeg so the `decode` feature links.
+      # 3c. Provision a prebuilt SHARED FFmpeg so the native decode engine links.
       #     ffmpeg-next v7 (ffmpeg-sys-next) compiles against the libav
       #     development headers/import libraries and uses bindgen/libclang, so
       #     it needs both an FFmpeg dev tree (FFMPEG_DIR) and libclang
@@ -117,7 +117,7 @@ jobs:
       #     in the same defensive style as the scrcpy jar validation below - if
       #     the download failed, the SHA256 did not match, or the extraction did
       #     not produce a usable ffmpeg\bin with avcodec*.dll.
-      - name: Provision FFmpeg (shared) for the decode feature
+      - name: Provision FFmpeg (shared) for the native decode engine
         shell: pwsh
         env:
           # Immutable, version-pinned FFmpeg 7.1.3 shared build (keep on 7.x
@@ -212,21 +212,28 @@ jobs:
       #    FLUXBRIDGE_RELEASE_VERSION (set in the previous step) flows into
       #    build.rs so the binary self-reports the tag version.
       #
-      #    This ships BOTH `gui` and `decode`: the real FFmpeg H.264 decode path
-      #    (the `decode` feature, backed by ffmpeg-next) is now part of the
-      #    Windows release, so mirrored frames are decoded to real pixels
-      #    instead of the pure-Rust StubDecoder's empty output. The preceding
-      #    "Provision FFmpeg (shared)" step makes ffmpeg-next link by setting
-      #    FFMPEG_DIR and LIBCLANG_PATH; the following "Stage FFmpeg runtime
-      #    DLLs" step copies the shared-build DLLs next to the exe so it runs.
-      #    `decode` is still OFF by default and NOT implied by `gui`, so the
-      #    headless `cargo build --workspace` / `--features gui` builds stay
-      #    green with no libav dependency.
-      - name: Build release binary (GUI + decode)
-        run: cargo build --release --features gui,decode --bin fluxbridge-desktop
+      #    This ships `gui` and `native-decode`: the native scrcpy decode
+      #    engine (option 2b) is the shipped decode path. The scrcpy-decode-sys
+      #    build.rs compiles the vendored scrcpy C (packet_merger) plus the
+      #    fb_decoder wrapper with the `cc` crate and links the SHARED FFmpeg
+      #    (avcodec/avformat/avutil/swscale) from FFMPEG_DIR/include and
+      #    FFMPEG_DIR/lib, so mirrored frames decode to real pixels instead of
+      #    the pure-Rust StubDecoder's empty output. windows-latest already has
+      #    the MSVC C/C++ toolchain the `cc` crate needs, and the preceding
+      #    "Provision FFmpeg (shared)" step sets FFMPEG_DIR (and LIBCLANG_PATH,
+      #    which the native path does not require but is harmless); the
+      #    following "Stage FFmpeg runtime DLLs" step copies the shared-build
+      #    DLLs next to the exe so it runs. `native-decode` is OFF by default
+      #    and NOT implied by `gui`, so the headless `cargo build --workspace` /
+      #    `--features gui` builds stay green with no libav dependency and no
+      #    vendored C compile. (The pure-Rust `decode`/ffmpeg-next fallback is
+      #    kept in the tree but NOT shipped; native-decode takes precedence in
+      #    the pipeline.)
+      - name: Build release binary (GUI + native decode)
+        run: cargo build --release --features gui,native-decode --bin fluxbridge-desktop
 
       # 4a. Stage the FFmpeg shared-build runtime DLLs next to the exe.
-      #     The decode feature links a SHARED FFmpeg, so the avcodec/avformat/
+      #     The native decode engine links a SHARED FFmpeg, so the avcodec/avformat/
       #     avutil/swscale/swresample (and avfilter/avdevice/postproc) DLLs must
       #     sit beside fluxbridge-desktop.exe at runtime or Windows fails to
       #     start the process. Copy every *.dll from the provisioned
@@ -329,13 +336,38 @@ jobs:
           }
           Write-Host "scrcpy server jar validated: $asset ($size bytes)."
 
+      # 4c. Stage the vendored scrcpy decode Apache-2.0 LICENSE + NOTICE next to
+      #     the exe. The native decode engine vendors scrcpy's packet_merger and
+      #     reimplements scrcpy's decode core (see native/scrcpy-decode), so the
+      #     Apache-2.0 attribution (NOTICE) and full license text (LICENSE) must
+      #     ship with the artifacts alongside the existing MIT scrcpy-server
+      #     LICENSE. Copy them into target\release under stable, self-describing
+      #     names so both the portable zip and the installer pick them up. The
+      #     guard fails the job if either file is missing from the checkout.
+      - name: Stage scrcpy decode LICENSE and NOTICE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          $srcLicense = "native\scrcpy-decode\LICENSE"
+          $srcNotice = "native\scrcpy-decode\NOTICE"
+          foreach ($p in @($srcLicense, $srcNotice)) {
+            if (-not (Test-Path $p)) {
+              throw "scrcpy decode attribution file missing: '$p' is required to ship the Apache-2.0 attribution for the native decode engine."
+            }
+          }
+          Copy-Item -Path $srcLicense -Destination target\release\scrcpy-decode-LICENSE -Force
+          Copy-Item -Path $srcNotice -Destination target\release\scrcpy-decode-NOTICE -Force
+          Write-Host "Staged scrcpy-decode-LICENSE and scrcpy-decode-NOTICE into target\release."
+
       # 5. Package the portable .zip containing the built .exe, the scrcpy
-      #    server jar beside it, AND the FFmpeg shared-build runtime DLLs, so
-      #    the portable build can mirror AND decode without a separate download
-      #    (resolve_server_jar looks next to the .exe, and Windows loads the
-      #    avcodec/avutil/etc. DLLs from the exe directory). The target\release
-      #    \*.dll glob picks up every FFmpeg DLL staged by the step above,
-      #    robust to FFmpeg's per-release version suffixes.
+      #    server jar beside it, the scrcpy decode Apache-2.0 LICENSE/NOTICE,
+      #    AND the FFmpeg shared-build runtime DLLs, so the portable build can
+      #    mirror AND decode without a separate download (resolve_server_jar
+      #    looks next to the .exe, and Windows loads the avcodec/avutil/etc.
+      #    DLLs from the exe directory). The target\release\*.dll glob picks up
+      #    every FFmpeg DLL staged by the step above, robust to FFmpeg's
+      #    per-release version suffixes.
       #    github.ref_name is the tag that triggered the run (for example v1.2.0).
       - name: Package portable zip
         shell: pwsh
@@ -345,6 +377,8 @@ jobs:
             -Path target\release\fluxbridge-desktop.exe, `
                   target\release\scrcpy-server.jar, `
                   target\release\scrcpy-server-LICENSE, `
+                  target\release\scrcpy-decode-LICENSE, `
+                  target\release\scrcpy-decode-NOTICE, `
                   target\release\*.dll `
             -DestinationPath "dist\FluxBridge-${{ github.ref_name }}-portable.zip" `
             -Force

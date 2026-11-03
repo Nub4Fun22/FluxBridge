@@ -91,8 +91,8 @@ Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription
 ; ---------------------------------------------------------------------------
 ; [Files]
 ;   The payload to install. The release workflow builds the optimized GUI
-;   binary with `cargo build --release --features gui` and the script packages
-;   that fluxbridge-desktop.exe. The LICENSE is installed alongside it so it is
+;   binary with `cargo build --release --features gui,native-decode` and the
+;   script packages that fluxbridge-desktop.exe. The LICENSE is installed alongside it so it is
 ;   available in the install directory.
 ;   Source paths are relative to this .iss file (installer/), so `..` steps up
 ;   to the repository root where CI drops the built binary.
@@ -117,9 +117,18 @@ Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; .github/workflows/release.yml). scrcpy's MIT LICENSE is shipped alongside it.
 Source: "..\target\release\scrcpy-server.jar"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\scrcpy-server-LICENSE"; DestDir: "{app}"; DestName: "scrcpy-server-LICENSE.txt"; Flags: ignoreversion
+; Ship the vendored scrcpy decode Apache-2.0 attribution. The native decode
+; engine (option 2b) vendors scrcpy's packet_merger and reimplements scrcpy's
+; decode core (see native/scrcpy-decode), so the Apache-2.0 LICENSE text and the
+; NOTICE (attribution + modification statement, Apache-2.0 section 4) must ship
+; with the installed app alongside the MIT scrcpy-server LICENSE above. CI stages
+; these from native/scrcpy-decode into ..\target\release before ISCC runs (see
+; .github/workflows/release.yml).
+Source: "..\target\release\scrcpy-decode-LICENSE"; DestDir: "{app}"; DestName: "scrcpy-decode-LICENSE.txt"; Flags: ignoreversion
+Source: "..\target\release\scrcpy-decode-NOTICE"; DestDir: "{app}"; DestName: "scrcpy-decode-NOTICE.txt"; Flags: ignoreversion
 ; Ship the FFmpeg shared-build runtime DLLs NEXT TO the .exe. The release
-; build enables the `decode` feature (cargo build --features gui,decode), which
-; links a SHARED FFmpeg via ffmpeg-next, so the avcodec/avformat/avutil/swscale/
+; build enables the `native-decode` feature (cargo build --features
+; gui,native-decode), whose scrcpy-decode-sys build.rs links a SHARED FFmpeg, so the avcodec/avformat/avutil/swscale/
 ; swresample (and avfilter/avdevice/postproc) DLLs MUST live in {app} beside
 ; fluxbridge-desktop.exe or Windows cannot start the process. CI stages every
 ; DLL from the provisioned ffmpeg\bin into ..\target\release (see
