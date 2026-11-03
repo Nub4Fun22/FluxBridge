@@ -1,0 +1,46 @@
+FluxBridge native decode engine
+================================
+
+This directory contains source code vendored from the scrcpy project, used
+under the terms of the Apache License, Version 2.0. The full license text is in
+the LICENSE file in this directory.
+
+scrcpy
+------
+Copyright (C) Genymobile and scrcpy contributors.
+Project: https://github.com/Genymobile/scrcpy
+Licensed under the Apache License, Version 2.0.
+
+Vendored files (verbatim, with include-only modifications)
+----------------------------------------------------------
+The following files were copied from scrcpy v5.0.1 and MODIFIED only to
+decouple them from scrcpy's internal include layer so they compile standalone
+against libavcodec / libavutil. The merge algorithm is unchanged. This
+statement of changes is provided per Apache License 2.0, section 4.
+
+  vendor/packet_merger.h
+    Upstream: scrcpy v5.0.1, app/src/packet_merger.h
+    Change:   replaced the scrcpy-internal include "common.h" with <stddef.h>.
+
+  vendor/packet_merger.c
+    Upstream: scrcpy v5.0.1, app/src/packet_merger.c
+    Change:   replaced the scrcpy-internal include "util/log.h" with a minimal
+              local LOG_OOM() macro (writes to stderr).
+
+Reimplemented from reference (NOT vendored verbatim)
+----------------------------------------------------
+fb_decoder.h (and its implementation fb_decoder.c, added in a later milestone)
+are FluxBridge-original code. They REIMPLEMENT the decode sequence proven by
+scrcpy, citing as reference:
+
+  scrcpy v5.0.1, app/src/decoder.c (sc_decoder_process_packet):
+    avcodec_send_packet followed by a loop of avcodec_receive_frame, with
+    AV_CODEC_FLAG_LOW_DELAY set on the codec context.
+  scrcpy v5.0.1, app/src/demuxer.c:
+    the 12-byte frame-header framing (pts/flags + payload length) and the
+    AVCodecParameters setup (codec id + dimensions).
+
+No scrcpy source beyond packet_merger.{c,h} is copied into FluxBridge; the rest
+of scrcpy's decode path (hardware-decode selection, the frame-source /
+packet-sink traits, the vecdeque and thread utilities, the stream session, and
+scrcpy's logging) is intentionally not vendored.
