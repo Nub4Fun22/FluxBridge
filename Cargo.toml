@@ -4,6 +4,13 @@ members = [
     "crates/core",
     "crates/updater",
     "crates/desktop",
+    # The native decode FFI crate. It is a workspace member because, with its
+    # `build-native` feature OFF (the default), it compiles NO C and links NO
+    # FFmpeg: build.rs is a no-op and src/lib.rs is just extern "C" signatures,
+    # so it builds cleanly on the headless Linux host. The vendored scrcpy C is
+    # compiled and FFmpeg is linked only on Windows/CI, where the desktop
+    # `native-decode` feature turns this crate's `build-native` on.
+    "crates/scrcpy-decode-sys",
 ]
 # The icon-generation helper is a developer-only tool. It is EXCLUDED from the
 # workspace so its heavy pure-Rust rendering dependencies (resvg/usvg/

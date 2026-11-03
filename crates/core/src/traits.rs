@@ -75,6 +75,65 @@ pub trait VideoDecoder: Send {
     /// Decode a single encoded frame into raw pixels.
     fn decode(&mut self, encoded: &[u8]) -> CoreResult<DecodedFrame>;
 
+    /// Decode exactly one access unit, carrying the stream framing flags.
+    ///
+    /// This is the seam the scrcpy stream driver uses so a decoder learns which
+    /// access units are config (SPS/PPS) units and which are keyframes, WITHOUT
+    /// the driver having to decide how a config unit is handled. That decision
+    /// belongs to the decoder, because different backends need it handled
+    /// differently:
+    ///
+    /// * The native engine (scrcpy's proven algorithm) must PREPEND a config
+    ///   unit to the next media packet and send the two as one Annex-B packet.
+    ///   Delivering the config unit through a separate `configure()` call with
+    ///   empty dimensions and a standalone extradata buffer is the root cause of
+    ///   the `send_packet: invalid data found when processing input` error, so
+    ///   that backend overrides this method to feed config bytes straight into
+    ///   its internal packet merger.
+    /// * The pure-Rust stub and the `ffmpeg-next` fallback keep their existing
+    ///   behaviour via the default implementation below.
+    ///
+    /// The default implementation preserves the pre-existing contract: a config
+    /// unit is forwarded to [`VideoDecoder::configure`] as `extra_data` (with
+    /// zero dimensions, which non-native decoders already tolerate) and yields
+    /// an empty [`DecodedFrame`] (no pixels are produced from a config unit),
+    /// while a media unit is forwarded to [`VideoDecoder::decode`]. A decoder
+    /// that needs the config bytes merged into the next media packet overrides
+    /// this method instead of relying on the default.
+    ///
+    /// Returning an empty-`data` [`DecodedFrame`] signals "no drawable frame
+    /// yet" to the caller, which only forwards non-empty frames to the UI.
+    fn decode_unit(
+        &mut self,
+        encoded: &[u8],
+        is_config: bool,
+        _is_keyframe: bool,
+    ) -> CoreResult<DecodedFrame> {
+        if is_config {
+            // Preserve the historical default: deliver the config unit as
+            // decoder extra_data. Dimensions are unknown at this seam (only the
+            // header/pipeline path knows them), so they are left at 0, which the
+            // stub and ffmpeg-next decoders already tolerate (they keep the
+            // non-zero geometry learned earlier). No drawable frame is produced
+            // from a config unit, so an empty frame is returned.
+            let cfg = VideoConfig {
+                codec: "h264".to_string(),
+                width: 0,
+                height: 0,
+                extra_data: encoded.to_vec(),
+            };
+            self.configure(&cfg)?;
+            Ok(DecodedFrame {
+                width: 0,
+                height: 0,
+                pixel_format: "rgba".to_string(),
+                data: Vec::new(),
+            })
+        } else {
+            self.decode(encoded)
+        }
+    }
+
     /// Flush any buffered frames and reset decoder state.
     fn flush(&mut self) -> CoreResult<()>;
 }

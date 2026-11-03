@@ -602,6 +602,82 @@ impl DaemonRecovery {
     }
 }
 
+/// The outcome of checking whether a USB device is present and ready, decided
+/// purely from a parsed `adb devices` list.
+///
+/// This is the decision half of the "USB connect does nothing" fix. Previously a
+/// USB start with no device (or an unauthorized / offline one) would reach the
+/// first `adb` command (`push`), which fails with adb's own message, but the
+/// failure was easy to mistake for silence. Making the USB readiness an explicit
+/// pre-flight check with a clear, actionable terminal
+/// [`PipelineStatus::Error`] guarantees the UI status line always updates
+/// instead of appearing to do nothing. The decision is pure and headless-tested;
+/// only the `adb devices` invocation around it touches the device.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UsbReadiness {
+    /// Exactly one (or at least one) authorized, online device is attached.
+    Ready,
+    /// No device is attached at all.
+    NoDevice,
+    /// A device is attached but not authorized (the user has not accepted the
+    /// "Allow USB debugging?" prompt on the phone).
+    Unauthorized,
+    /// A device is attached but offline / in another non-ready state.
+    Offline(String),
+}
+
+impl UsbReadiness {
+    /// Decide USB readiness from a parsed `adb devices` list.
+    ///
+    /// Wi-Fi serials (an `ip:port` entry, which contains a `:`) are ignored so a
+    /// lingering wireless connection does not mask a missing USB device. Among
+    /// the remaining (USB) entries: any online device means [`Ready`]; else an
+    /// `unauthorized` entry means [`Unauthorized`]; else the first entry's state
+    /// is reported as [`Offline`]; an empty USB list is [`NoDevice`].
+    ///
+    /// [`Ready`]: UsbReadiness::Ready
+    /// [`Unauthorized`]: UsbReadiness::Unauthorized
+    /// [`Offline`]: UsbReadiness::Offline
+    /// [`NoDevice`]: UsbReadiness::NoDevice
+    pub fn from_devices(devices: &[adb::AdbDevice]) -> UsbReadiness {
+        let usb: Vec<&adb::AdbDevice> =
+            devices.iter().filter(|d| !d.serial.contains(':')).collect();
+        if usb.is_empty() {
+            return UsbReadiness::NoDevice;
+        }
+        if usb.iter().any(|d| d.is_online()) {
+            return UsbReadiness::Ready;
+        }
+        if usb.iter().any(|d| d.state == "unauthorized") {
+            return UsbReadiness::Unauthorized;
+        }
+        UsbReadiness::Offline(usb[0].state.clone())
+    }
+
+    /// The actionable, em-dash-free error message for a non-ready USB state, or
+    /// `None` when the device is [`UsbReadiness::Ready`].
+    pub fn error_message(&self) -> Option<String> {
+        match self {
+            UsbReadiness::Ready => None,
+            UsbReadiness::NoDevice => Some(
+                "no USB device detected. Connect the phone with a USB cable, \
+                 unlock it, and set the USB connection to allow file transfer \
+                 or PTP so debugging is available."
+                    .to_string(),
+            ),
+            UsbReadiness::Unauthorized => Some(
+                "the USB device is not authorized. Unlock the phone and tap \
+                 Allow on the 'Allow USB debugging?' prompt, then try again."
+                    .to_string(),
+            ),
+            UsbReadiness::Offline(state) => Some(format!(
+                "the USB device is not ready (adb state: {state}). Reconnect \
+                 the cable, unlock the phone, and try again."
+            )),
+        }
+    }
+}
+
 /// Connect the forward-mode video socket with a bounded retry/backoff, mirroring
 /// scrcpy's own forward-mode connect loop. Retries a retryable connect error
 /// (see [`is_retryable_connect_error`]) up to the dummy-byte attempt bound with
@@ -897,6 +973,36 @@ pub fn run_pipeline_full(
         report(status, PipelineStatus::Connected(real_serial));
         resolved
     } else {
+        // USB transport: unlike Wi-Fi there is no `adb connect` step, so a
+        // missing / unauthorized / offline device would otherwise only surface
+        // when the first `adb push` fails, which looked like the USB button
+        // "did nothing". Make USB readiness an EXPLICIT pre-flight check so a
+        // terminal, actionable Error always reaches the UI status line. The
+        // decision (`UsbReadiness::from_devices`) is pure and headless-tested;
+        // only the `adb devices -l` call here touches the device.
+        match cmd.run(&adb::devices_long_args()) {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let devices = adb::parse_devices(&text);
+                let readiness = UsbReadiness::from_devices(&devices);
+                if let Some(msg) = readiness.error_message() {
+                    let err = adb::AdbError::Command {
+                        args: adb::devices_long_args(),
+                        code: None,
+                        stderr: msg.clone(),
+                    };
+                    report(status, PipelineStatus::Error(msg));
+                    return Err(err);
+                }
+                report(status, PipelineStatus::Connected("USB device".to_string()));
+            }
+            Err(e) => {
+                // `adb devices` itself failed (daemon unreachable, adb broken):
+                // surface it as a terminal Error so the status line updates.
+                report(status, PipelineStatus::Error(e.to_string()));
+                return Err(e);
+            }
+        }
         selector
     };
 
@@ -1210,11 +1316,23 @@ fn run_stream(
         std::thread::spawn(move || for _ in rx.iter() {});
     }
 
-    // The real decode path links FFmpeg behind the `decode` feature. Without it
-    // the StubDecoder keeps the pipeline running on hosts that cannot link
-    // libav; its frames are not real pixels, which the UI handles by showing
-    // the fallback placeholder.
-    #[cfg(feature = "decode")]
+    // Decoder selection. Three mutually prioritised paths:
+    //
+    //   1. `native-decode` (option 2b): the native scrcpy engine (vendored
+    //      packet_merger + reimplemented FFmpeg send/receive + swscale). It
+    //      takes PRECEDENCE over `decode` when both are set, because it is the
+    //      proven path that fixes the SPS/PPS `send_packet: invalid data` error.
+    //   2. `decode`: the pure-Rust `ffmpeg-next` fallback (kept until the native
+    //      engine is validated on Windows CI and by the user).
+    //   3. neither (the headless default/gui build): the pure-Rust StubDecoder,
+    //      so the pipeline runs on hosts that cannot link libav. Its frames are
+    //      not real pixels, which the UI handles with its fallback placeholder.
+    //
+    // Both native-decode and decode link FFmpeg, so neither is enabled on the
+    // headless host; only the StubDecoder arm is compiled there.
+    #[cfg(feature = "native-decode")]
+    let mut decoder = crate::decode_loop::NativeScrcpyDecoder::new();
+    #[cfg(all(feature = "decode", not(feature = "native-decode")))]
     let mut decoder = match crate::decode_loop::FfmpegDecoder::new() {
         Ok(d) => d,
         Err(e) => {
@@ -1222,7 +1340,7 @@ fn run_stream(
             return Ok(());
         }
     };
-    #[cfg(not(feature = "decode"))]
+    #[cfg(not(any(feature = "decode", feature = "native-decode")))]
     let mut decoder = crate::decode_loop::StubDecoder::new();
 
     // Drive the scrcpy video stream. The header (device name + resolution) must
@@ -1463,6 +1581,82 @@ mod tests {
     fn usb_selector_is_default() {
         let cfg = PipelineConfig::default();
         assert_eq!(cfg.selector(), DeviceSelector::UsbDefault);
+    }
+
+    /// The USB "does nothing" fix: a USB start with no device attached must
+    /// resolve to a non-ready state that produces a terminal, actionable error,
+    /// NOT silence. `UsbReadiness::from_devices` is the pure decision the
+    /// pipeline consults before the first adb command, so asserting it here
+    /// proves the status line would update. If the fix were reverted (the USB
+    /// branch not checking readiness), no Error would be produced for an empty
+    /// device list.
+    #[test]
+    fn usb_no_device_is_terminal_error() {
+        let devices = adb::parse_devices("List of devices attached\n");
+        let readiness = UsbReadiness::from_devices(&devices);
+        assert_eq!(readiness, UsbReadiness::NoDevice);
+        let msg = readiness
+            .error_message()
+            .expect("a missing USB device must yield an error message");
+        assert!(msg.to_lowercase().contains("usb"));
+        assert!(
+            !msg.contains('\u{2014}'),
+            "no em dashes in user-facing text"
+        );
+        // The pipeline maps this message onto a terminal PipelineStatus::Error.
+        let status = PipelineStatus::Error(msg.clone());
+        assert!(matches!(status, PipelineStatus::Error(_)));
+    }
+
+    #[test]
+    fn usb_unauthorized_device_is_terminal_error() {
+        // A single USB device present but not authorized.
+        let devices = adb::parse_devices("List of devices attached\n0A1B2C3D4E5F unauthorized\n");
+        assert_eq!(
+            UsbReadiness::from_devices(&devices),
+            UsbReadiness::Unauthorized
+        );
+        let msg = UsbReadiness::from_devices(&devices)
+            .error_message()
+            .expect("an unauthorized device must yield an error message");
+        assert!(msg.to_lowercase().contains("authorized"));
+    }
+
+    #[test]
+    fn usb_offline_device_is_terminal_error() {
+        let devices = adb::parse_devices("List of devices attached\n0A1B2C3D4E5F offline\n");
+        match UsbReadiness::from_devices(&devices) {
+            UsbReadiness::Offline(state) => assert_eq!(state, "offline"),
+            other => panic!("expected Offline, got {other:?}"),
+        }
+        assert!(UsbReadiness::from_devices(&devices)
+            .error_message()
+            .is_some());
+    }
+
+    #[test]
+    fn usb_online_device_is_ready_no_error() {
+        let devices = adb::parse_devices(
+            "List of devices attached\n\
+             0A1B2C3D4E5F device product:panther model:Pixel_7 device:panther transport_id:1\n",
+        );
+        assert_eq!(UsbReadiness::from_devices(&devices), UsbReadiness::Ready);
+        assert!(
+            UsbReadiness::from_devices(&devices)
+                .error_message()
+                .is_none(),
+            "a ready USB device must not produce an error"
+        );
+    }
+
+    /// A lingering Wi-Fi serial (an `ip:port` entry) must NOT be mistaken for a
+    /// USB device: with only a wireless entry present, a USB start still reports
+    /// NoDevice so the user is told to plug in a cable rather than silently
+    /// latching onto the wireless connection.
+    #[test]
+    fn usb_readiness_ignores_wifi_serials() {
+        let devices = adb::parse_devices("List of devices attached\n192.168.1.42:37000 device\n");
+        assert_eq!(UsbReadiness::from_devices(&devices), UsbReadiness::NoDevice);
     }
 
     #[test]

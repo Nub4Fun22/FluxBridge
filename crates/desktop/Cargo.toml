@@ -72,6 +72,14 @@ ffmpeg-next = { version = "7", optional = true }
 # artifact and does not rely on this crate.
 png = { version = "0.17", optional = true }
 
+# The native scrcpy decode engine FFI crate (option 2b). OPTIONAL and OFF by
+# default: it is pulled in ONLY by the `native-decode` feature (see [features]).
+# With `native-decode` off, this dependency is absent and nothing compiles the
+# vendored C or links FFmpeg, so the headless default/gui builds stay green. When
+# `native-decode` is on, the desktop crate turns on this crate's `build-native`
+# feature, which is what compiles the C and links FFmpeg (Windows/CI only).
+scrcpy-decode-sys = { path = "../scrcpy-decode-sys", version = "0.4.0", optional = true }
+
 [build-dependencies]
 # Only needed when the `gui` feature compiles ui/app.slint.
 slint-build = { version = "1", optional = true }
@@ -94,3 +102,15 @@ gui = ["dep:slint", "dep:slint-build", "dep:png"]
 # real VideoDecoder: `cargo build --features decode`. On headless Linux without
 # libav this will fail to link, which is expected.
 decode = ["dep:ffmpeg-next"]
+# The native scrcpy decode engine (option 2b): vendored scrcpy packet_merger +
+# a reimplemented FFmpeg send/receive + swscale-to-RGBA wrapper, bound via the
+# scrcpy-decode-sys FFI crate. OFF by default and NOT part of `default` or
+# `gui`. Enabling it turns on scrcpy-decode-sys's `build-native` feature, which
+# COMPILES the vendored scrcpy C and LINKS FFmpeg (avcodec/avformat/avutil/
+# swscale) against FFMPEG_DIR. That requires FFmpeg dev libraries, so it is
+# Windows/CI-only: the release workflow provisions LLVM + BtbN FFmpeg and sets
+# FFMPEG_DIR before `cargo build --features native-decode`. On the headless
+# Linux host (no FFmpeg) this will NOT link, which is expected; default/gui stay
+# green there because this feature is off. It takes precedence over `decode`
+# when both are set (see pipeline.rs::run_pipeline_full).
+native-decode = ["dep:scrcpy-decode-sys", "scrcpy-decode-sys/build-native"]

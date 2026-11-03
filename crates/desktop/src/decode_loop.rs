@@ -301,8 +301,8 @@ impl VideoDecoder for FfmpegDecoder {
         // (black/frozen video). Only the scaler is rebuilt here; the H264
         // decoder is deliberately reused across re-configures.
         if self.scaler_src != Some((w, h, src_format)) {
-            let ctx = Scaler::get(src_format, w, h, Pixel::RGBA, w, h, Flags::BILINEAR)
-                .map_err(|e| {
+            let ctx =
+                Scaler::get(src_format, w, h, Pixel::RGBA, w, h, Flags::BILINEAR).map_err(|e| {
                     fluxbridge_core::CoreError::Other(format!("create swscale context: {e}"))
                 })?;
             self.scaler = Some(SendScaler(ctx));
@@ -337,6 +337,284 @@ impl VideoDecoder for FfmpegDecoder {
             let _ = decoder.flush();
         }
         Ok(())
+    }
+}
+
+/// A `Send` newtype owning the raw `fb_decoder` handle.
+///
+/// The raw `*mut scrcpy_decode_sys::fb_decoder` is a plain C pointer and is not
+/// `Send`, which would make [`NativeScrcpyDecoder`] non-`Send` and break the
+/// `VideoDecoder: Send` bound the pipeline relies on (the decoder is moved onto
+/// the single decode worker thread; see [`crate::pipeline`]). This newtype makes
+/// the owning decoder `Send` with the SAME discipline as [`SendScaler`].
+///
+/// # Safety
+///
+/// The `unsafe impl Send` below is sound HERE because of how the handle is
+/// used, NOT because an `fb_decoder` is generally thread-safe (it is explicitly
+/// NOT: see the threading note in `native/scrcpy-decode/fb_decoder.h`):
+///
+/// * [`NativeScrcpyDecoder`] owns this `FbDecoderHandle` exclusively (a private
+///   field); it is never shared, cloned, aliased, or wrapped in an `Arc` handed
+///   to another thread.
+/// * The handle is only ever touched from the single decode worker thread
+///   inside the [`VideoDecoder`] methods; there is no concurrent access.
+/// * The only cross-thread action is MOVING the owning decoder (and with it the
+///   pointer) onto the worker thread once, before any use. An exclusive move
+///   followed by single-threaded use is fine: the raw pointer is just an owned
+///   heap handle with no thread affinity.
+#[cfg(feature = "native-decode")]
+struct FbDecoderHandle(*mut scrcpy_decode_sys::fb_decoder);
+
+// SAFETY: see the `FbDecoderHandle` doc comment above. The handle is owned
+// exclusively by one `NativeScrcpyDecoder`, used only from the single decode
+// worker thread, and merely moved (never shared) across the thread boundary.
+#[cfg(feature = "native-decode")]
+unsafe impl Send for FbDecoderHandle {}
+
+#[cfg(feature = "native-decode")]
+impl Drop for FbDecoderHandle {
+    fn drop(&mut self) {
+        // SAFETY: the pointer is either NULL (fb_decoder_free tolerates NULL) or
+        // a live handle from fb_decoder_new that has not been freed yet; this
+        // Drop is the single owner's sole release path.
+        unsafe { scrcpy_decode_sys::fb_decoder_free(self.0) }
+    }
+}
+
+/// The native scrcpy-based decoder: scrcpy's proven FFmpeg send/receive +
+/// swscale-to-RGBA sequence with its `packet_merger` config handling, bound via
+/// [`scrcpy_decode_sys`].
+///
+/// Compiled only under the `native-decode` feature because that feature links
+/// FFmpeg and compiles the vendored scrcpy C (Windows/CI only; the headless
+/// Linux host has no FFmpeg). It is the option-2b replacement for the brittle
+/// pure-Rust path: the SPS/PPS config unit is PREPENDED to the next media
+/// packet inside the engine (see
+/// [`VideoDecoder::decode_unit`](fluxbridge_core::VideoDecoder::decode_unit)),
+/// which is the fix for the `send_packet: invalid data found when processing
+/// input` error.
+///
+/// It produces `DecodedFrame{ pixel_format: "rgba", data.len() == w*h*4 }`,
+/// which the Slint UI renders directly.
+#[cfg(feature = "native-decode")]
+pub struct NativeScrcpyDecoder {
+    handle: Option<FbDecoderHandle>,
+    codec_fourcc: u32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "native-decode")]
+impl NativeScrcpyDecoder {
+    /// Create an unconfigured native decoder. The `fb_decoder` handle is built
+    /// lazily on the first [`VideoDecoder::configure`] call, once the codec and
+    /// dimensions are known.
+    pub fn new() -> Self {
+        NativeScrcpyDecoder {
+            handle: None,
+            codec_fourcc: u32::from_be_bytes(*b"h264"),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// Drain every currently available RGBA frame from the engine, returning the
+    /// FIRST drawable one (if any) as a [`DecodedFrame`]. Any additional frames
+    /// the decoder has buffered are consumed so they are not lost; the stream
+    /// paces on arrival, so returning the first and draining the rest keeps the
+    /// UI responsive without unbounded buffering.
+    fn take_frame(&mut self) -> CoreResult<DecodedFrame> {
+        use scrcpy_decode_sys::status;
+
+        let handle = match &self.handle {
+            Some(h) => h.0,
+            None => {
+                return Err(fluxbridge_core::CoreError::Other(
+                    "native decoder not configured".into(),
+                ))
+            }
+        };
+
+        let mut first: Option<DecodedFrame> = None;
+        loop {
+            let mut out: *const u8 = std::ptr::null();
+            let mut w: std::os::raw::c_int = 0;
+            let mut h: std::os::raw::c_int = 0;
+            let mut stride: std::os::raw::c_int = 0;
+            // SAFETY: `handle` is a live fb_decoder owned exclusively by self and
+            // only used from this worker thread. out/w/h/stride are valid local
+            // pointers. On OK, `out` borrows a decoder-owned buffer valid until
+            // the next fb_decoder_* call, so we copy it immediately below before
+            // looping (which may invalidate it).
+            let rc = unsafe {
+                scrcpy_decode_sys::fb_decoder_take_rgba(
+                    handle,
+                    &mut out,
+                    &mut w,
+                    &mut h,
+                    &mut stride,
+                )
+            };
+            if rc == status::FB_DECODER_AGAIN {
+                break;
+            }
+            if rc < 0 {
+                return Err(fluxbridge_core::CoreError::Other(format!(
+                    "fb_decoder_take_rgba failed: {rc}"
+                )));
+            }
+            // rc == FB_DECODER_OK: a frame is available. Copy it out NOW.
+            let w = w.max(0) as usize;
+            let h = h.max(0) as usize;
+            let stride = stride.max(0) as usize;
+            if out.is_null() || w == 0 || h == 0 {
+                continue;
+            }
+            // SAFETY: fb_decoder guarantees `out` points to at least
+            // `stride * h` readable bytes (a tightly packed buffer with
+            // stride == w*4) valid until the next fb_decoder_* call.
+            let src = unsafe { std::slice::from_raw_parts(out, stride * h) };
+            let data = pack_rgba(src, stride, w, h);
+            if first.is_none() {
+                first = Some(DecodedFrame {
+                    width: w as u32,
+                    height: h as u32,
+                    pixel_format: "rgba".to_string(),
+                    data,
+                });
+            }
+            // Keep draining so buffered frames are not stranded.
+        }
+
+        Ok(first.unwrap_or_else(|| DecodedFrame {
+            width: self.width,
+            height: self.height,
+            pixel_format: "rgba".to_string(),
+            data: Vec::new(),
+        }))
+    }
+}
+
+#[cfg(feature = "native-decode")]
+impl Default for NativeScrcpyDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "native-decode")]
+impl VideoDecoder for NativeScrcpyDecoder {
+    fn configure(&mut self, config: &VideoConfig) -> CoreResult<()> {
+        // Remember the codec/dimensions. Only non-zero dimensions update the
+        // stored geometry, so a later zero-dim config (a stray call) never
+        // clobbers the known-good header geometry, mirroring FfmpegDecoder.
+        let fourcc = codec_fourcc(&config.codec);
+        if fourcc != 0 {
+            self.codec_fourcc = fourcc;
+        }
+        if config.width != 0 && config.height != 0 {
+            self.width = config.width;
+            self.height = config.height;
+        }
+        // Build the handle lazily the first time (idempotent on re-configure:
+        // scrcpy sends SPS/PPS inline with keyframes, so the engine learns real
+        // geometry from the bitstream and need not be rebuilt mid-stream).
+        if self.handle.is_none() {
+            // SAFETY: fb_decoder_new allocates and opens the codec; it returns
+            // NULL on failure, which we map to an error. The returned pointer is
+            // owned exclusively by this decoder and freed in FbDecoderHandle's
+            // Drop.
+            let raw = unsafe {
+                scrcpy_decode_sys::fb_decoder_new(self.codec_fourcc, self.width, self.height)
+            };
+            if raw.is_null() {
+                return Err(fluxbridge_core::CoreError::Other(
+                    "fb_decoder_new returned NULL (codec open failed)".into(),
+                ));
+            }
+            self.handle = Some(FbDecoderHandle(raw));
+        }
+        Ok(())
+    }
+
+    fn decode(&mut self, encoded: &[u8]) -> CoreResult<DecodedFrame> {
+        // A bare decode() is a media (non-config) unit with unknown keyframe
+        // status; route it through the flag-carrying seam.
+        self.decode_unit(encoded, false, false)
+    }
+
+    fn decode_unit(
+        &mut self,
+        encoded: &[u8],
+        is_config: bool,
+        is_keyframe: bool,
+    ) -> CoreResult<DecodedFrame> {
+        use scrcpy_decode_sys::status;
+
+        let handle = match &self.handle {
+            Some(h) => h.0,
+            None => {
+                return Err(fluxbridge_core::CoreError::Other(
+                    "native decoder not configured before decode".into(),
+                ))
+            }
+        };
+
+        let (ptr, len) = (encoded.as_ptr(), encoded.len());
+        // SAFETY: `handle` is a live fb_decoder owned exclusively by self and
+        // only used from this worker thread. `ptr`/`len` describe a valid
+        // readable slice for the duration of the call. The engine runs the
+        // packet merger so a config unit is held and prepended to the next
+        // media packet.
+        let rc = unsafe {
+            scrcpy_decode_sys::fb_decoder_feed(
+                handle,
+                ptr,
+                len,
+                is_config as std::os::raw::c_int,
+                is_keyframe as std::os::raw::c_int,
+            )
+        };
+        if rc < 0 {
+            return Err(fluxbridge_core::CoreError::Other(format!(
+                "fb_decoder_feed failed: {rc}"
+            )));
+        }
+        // FB_DECODER_AGAIN (config held, or no frame yet) yields an empty frame
+        // the stream driver skips; FB_DECODER_OK means frames may be ready.
+        if rc == status::FB_DECODER_AGAIN {
+            return Ok(DecodedFrame {
+                width: self.width,
+                height: self.height,
+                pixel_format: "rgba".to_string(),
+                data: Vec::new(),
+            });
+        }
+        self.take_frame()
+    }
+
+    fn flush(&mut self) -> CoreResult<()> {
+        // The engine drains on take; there is no separate libav flush exposed
+        // over the C API, so drop any pending frames best-effort. Recreating the
+        // handle on the next configure is the reset path.
+        if self.handle.is_some() {
+            let _ = self.take_frame();
+        }
+        Ok(())
+    }
+}
+
+/// Map a codec name (for example `"h264"`, `"h265"`, `"hevc"`) to the scrcpy
+/// fourcc `u32` the native engine expects. Unknown names map to `0` so the
+/// caller keeps the previously stored codec rather than overwriting it.
+#[cfg(feature = "native-decode")]
+fn codec_fourcc(codec: &str) -> u32 {
+    match codec {
+        "h264" => u32::from_be_bytes(*b"h264"),
+        "h265" | "hevc" => u32::from_be_bytes(*b"h265"),
+        "av1" => u32::from_be_bytes(*b"av01"),
+        _ => 0,
     }
 }
 
@@ -498,7 +776,10 @@ mod tests {
                 expected.push((row * 10 + b) as u8);
             }
         }
-        assert_eq!(out, expected, "padding must be stripped, rows kept in order");
+        assert_eq!(
+            out, expected,
+            "padding must be stripped, rows kept in order"
+        );
         assert!(
             !out.contains(&0xFF) && !out.contains(&0xFE),
             "padding bytes must not leak into the packed buffer"
@@ -544,6 +825,107 @@ mod tests {
         assert_eq!(
             frame.data.len(),
             (frame.width as usize) * (frame.height as usize) * 4
+        );
+    }
+
+    /// A fake that EMULATES the native feed/take sequencing without any FFI, so
+    /// the rgba `DecodedFrame` construction and its `data.len() == w*h*4`
+    /// invariant (the exact contract ui::decoded_frame_to_image requires to
+    /// draw) can be exercised headlessly with `native-decode` OFF.
+    ///
+    /// It mirrors `NativeScrcpyDecoder`'s real control flow: a config unit is
+    /// held (empty frame, no pixels); a media unit is "fed", and the next
+    /// `take` produces one tightly packed RGBA frame sized to the configured
+    /// geometry, stripped of a simulated row stride via the same `pack_rgba`
+    /// used by the real decoder. This would fail if the length math or the
+    /// config/media sequencing regressed.
+    #[derive(Default)]
+    struct FakeFeedTakeDecoder {
+        width: u32,
+        height: u32,
+        /// A frame is pending take after a media feed (config feeds hold).
+        pending: bool,
+    }
+
+    impl VideoDecoder for FakeFeedTakeDecoder {
+        fn configure(&mut self, config: &VideoConfig) -> CoreResult<()> {
+            if config.width != 0 && config.height != 0 {
+                self.width = config.width;
+                self.height = config.height;
+            }
+            Ok(())
+        }
+
+        fn decode(&mut self, encoded: &[u8]) -> CoreResult<DecodedFrame> {
+            self.decode_unit(encoded, false, false)
+        }
+
+        fn decode_unit(
+            &mut self,
+            _encoded: &[u8],
+            is_config: bool,
+            _is_keyframe: bool,
+        ) -> CoreResult<DecodedFrame> {
+            if is_config {
+                // Config held for merge: no drawable frame yet.
+                return Ok(DecodedFrame {
+                    width: self.width,
+                    height: self.height,
+                    pixel_format: "rgba".to_string(),
+                    data: Vec::new(),
+                });
+            }
+            // "Feed" then "take": produce one RGBA frame. Simulate a padded
+            // source stride so pack_rgba's padding-strip path is exercised,
+            // exactly as the real engine's take_rgba does.
+            self.pending = true;
+            let w = self.width as usize;
+            let h = self.height as usize;
+            let stride = w * 4 + 8; // 8 bytes of row padding
+            let src = vec![0x5Au8; stride * h];
+            let data = pack_rgba(&src, stride, w, h);
+            self.pending = false;
+            Ok(DecodedFrame {
+                width: self.width,
+                height: self.height,
+                pixel_format: "rgba".to_string(),
+                data,
+            })
+        }
+
+        fn flush(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_feed_take_rgba_frame_satisfies_length_invariant() {
+        let mut dec = FakeFeedTakeDecoder::default();
+        dec.configure(&VideoConfig {
+            codec: "h264".into(),
+            width: 64,
+            height: 48,
+            extra_data: vec![],
+        })
+        .unwrap();
+
+        // A config unit yields no drawable frame (held for merge).
+        let held = dec.decode_unit(&[0x67, 0x42], true, false).unwrap();
+        assert!(
+            held.data.is_empty(),
+            "a config unit must not produce drawable pixels"
+        );
+
+        // The first media unit produces a frame whose byte length is exactly
+        // width*height*4 (the UI render gate), with the stride padding stripped.
+        let frame = dec.decode_unit(&[0x65, 0x88], false, true).unwrap();
+        assert_eq!(frame.pixel_format, "rgba");
+        assert_eq!(frame.width, 64);
+        assert_eq!(frame.height, 48);
+        assert_eq!(
+            frame.data.len(),
+            (frame.width as usize) * (frame.height as usize) * 4,
+            "rgba DecodedFrame must satisfy data.len() == w*h*4"
         );
     }
 

@@ -1,0 +1,34 @@
+[package]
+name = "scrcpy-decode-sys"
+description = "FFI bindings to the FluxBridge native decode engine (scrcpy's vendored packet_merger + a reimplemented FFmpeg send/receive + swscale-to-RGBA wrapper). The C compile and the FFmpeg link happen ONLY under the `build-native` feature; the default build is a pure no-op that exposes just the extern \"C\" signatures, so it builds on the headless Linux host with no FFmpeg present."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# The build script only compiles/links C when `build-native` is set; with the
+# feature OFF it is a no-op. It is still declared so the crate has a build.rs to
+# gate on, and Cargo compiles build.rs itself (which this crate verifies on the
+# headless host).
+build = "build.rs"
+
+[lib]
+name = "scrcpy_decode_sys"
+path = "src/lib.rs"
+
+[features]
+# OFF by default. When enabled, build.rs uses the `cc` crate to compile the
+# vendored scrcpy C (fb_decoder.c + vendor/packet_merger.c) and emits the
+# cargo link directives for the FFmpeg libraries, reading include/lib dirs from
+# the FFMPEG_DIR env the release workflow sets. This is Windows/CI-only: the
+# headless Linux host has no FFmpeg, so the default (feature OFF) build compiles
+# only the Rust FFI declarations and performs NO C compile and NO link.
+default = []
+build-native = ["dep:cc"]
+
+[build-dependencies]
+# `cc` is ONLY pulled when `build-native` is enabled. The host has cc/gcc/clang
+# so the crate loads, but it is never invoked unless the feature is on, keeping
+# the default build a clean no-op.
+cc = { version = "1", optional = true }

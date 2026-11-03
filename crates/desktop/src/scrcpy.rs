@@ -162,7 +162,10 @@ pub enum PacketRead {
 /// Whether an I/O error is a read-timeout wake (`WouldBlock` on Unix,
 /// `TimedOut` on Windows) rather than a real failure.
 fn is_timeout(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 /// Read one length-prefixed access unit from the video socket.
@@ -442,14 +445,19 @@ pub fn never_cancel() -> bool {
 /// This is the loop body shared by [`stream_video`] (the headless-testable
 /// all-in-one entry point) and [`crate::pipeline`] (which parses the header
 /// separately so it can size the control sink from the device resolution before
-/// frames start flowing). For every access unit:
+/// frames start flowing). Every access unit (config and media alike) is handed
+/// to the decoder through the single `decode_unit` seam, carrying the scrcpy
+/// `is_config`/`is_keyframe` flags:
 ///
-/// * `is_config` units carry SPS/PPS. We record the codec extradata via
-///   `configure` AND feed the SPS/PPS Annex-B bytes through `decode` so they
-///   reach the decoder's packet path and prime the h264 parser before the
-///   first frame. scrcpy (MediaCodec) sends this codec config ONCE up front and
-///   does NOT repeat it before each keyframe, so dropping it here would leave
-///   the decoder with no context and the first real frame would fail;
+/// * `is_config` units carry SPS/PPS. They are delivered to the decoder as DATA
+///   through `decode_unit` with `is_config == true`, NOT dropped and NOT sent
+///   as a separate `configure()`-with-empty-dims call. scrcpy (MediaCodec)
+///   sends this codec config ONCE up front and does NOT repeat it before each
+///   keyframe, so dropping it here would leave the decoder with no context and
+///   the first real frame would fail. The decoder decides how the config unit
+///   is used: the native engine PREPENDS it to the next media packet via
+///   scrcpy's packet_merger, while the stub/ffmpeg-next decoders keep their
+///   historical behaviour via the trait's default `decode_unit`;
 /// * every other unit is decoded and, if the decoder produced drawable pixels
 ///   (a non-empty buffer), forwarded to `frame_sink`.
 ///
@@ -491,43 +499,20 @@ pub fn stream_av_packets<R: Read>(
             }
         };
 
-        if packet.is_config {
-            // Config access units carry SPS/PPS. scrcpy (MediaCodec) sends this
-            // codec config ONCE up front as the leading config packet and does
-            // NOT re-inline it before each keyframe, so it MUST reach the
-            // decoder here or the first real frame has no decode context and
-            // send_packet fails with AVERROR_INVALIDDATA.
-            //
-            // We do two things:
-            //   1. configure() records the codec extradata intent. Dimensions
-            //      are left at 0 here because only the pipeline/header path
-            //      knows them; a real decoder reads geometry from the stream.
-            //   2. decode() feeds the raw SPS/PPS Annex-B NAL bytes through the
-            //      decoder's packet path so the h264 parser is primed exactly
-            //      as inline SPS/PPS would do. The config access unit yields no
-            //      drawable frame (an empty buffer), so it is never forwarded to
-            //      frame_sink.
-            // Capture the bytes before configure() because packet.data moves
-            // into the VideoConfig.
-            let config_data = packet.data;
-            let cfg = VideoConfig {
-                codec: "h264".to_string(),
-                width: 0,
-                height: 0,
-                extra_data: config_data.clone(),
-            };
-            decoder.configure(&cfg)?;
-            // Feed the SPS/PPS NALs through the decode seam to prime the
-            // decoder. This is tolerated mid-stream too: a config packet
-            // arriving when the decoder is already open just re-primes the
-            // parser and still produces no drawable frame.
-            let _ = decoder.decode(&config_data)?;
-            continue;
-        }
-
-        let frame = decoder.decode(&packet.data)?;
-        // The decoder returns an empty buffer when it needs more input before a
-        // frame is ready; skip those so the sink only sees drawable frames.
+        // Deliver EVERY access unit (config and media alike) through the single
+        // decode_unit seam, carrying the scrcpy is_config/is_keyframe flags. The
+        // decoder decides how a config unit is handled: the native engine
+        // PREPENDS the config (SPS/PPS) bytes to the next media packet (scrcpy's
+        // proven packet_merger), which is the correctness fix for the
+        // `send_packet: invalid data found when processing input` error, while
+        // the stub/ffmpeg-next decoders keep their historical behaviour via the
+        // trait's default decode_unit. Crucially the config unit is NOT dropped
+        // here and NOT sent as a separate configure()-with-empty-dims call: it
+        // flows to the decoder as data so the engine can merge it.
+        let frame = decoder.decode_unit(&packet.data, packet.is_config, packet.is_keyframe)?;
+        // The decoder returns an empty buffer when it has no drawable frame yet
+        // (a config unit held for merging, or a media unit that needs more
+        // input); skip those so the sink only sees drawable frames.
         if frame.data.is_empty() {
             continue;
         }
@@ -1027,19 +1012,26 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
-    /// A fake decoder that records the config it saw and the access units it
-    /// decoded, and tags each decoded frame as drawable `"rgba"` so the stream
-    /// driver forwards it.
+    /// A fake decoder that records how the stream driver delivers access units
+    /// through the `decode_unit` seam, and tags each media frame as drawable
+    /// `"rgba"` so the stream driver forwards it.
     ///
-    /// `decoded` captures every byte run passed to `decode()` in order. Because
-    /// the config (SPS/PPS) access unit is now fed through `decode()` too, its
-    /// bytes appear in `decoded`. To make the delivery contract explicit and
-    /// order-aware, `config_fed` records the raw SPS/PPS bytes fed from the
-    /// is_config branch and `config_fed_before_first_frame` records whether that
-    /// delivery happened before any real (non-config) frame was decoded. The
-    /// decoder learns a unit is a config unit via `last_configured_extra`, which
-    /// `configure()` stashes so the very next `decode()` call (the config feed)
-    /// can be attributed to the config path.
+    /// The stream driver now routes EVERY access unit through `decode_unit`,
+    /// carrying the scrcpy `is_config`/`is_keyframe` flags, instead of handling
+    /// the config (SPS/PPS) unit itself with a `configure()`-with-empty-dims
+    /// call. To keep the delivery contract explicit and order-aware this fake
+    /// overrides `decode_unit` directly:
+    ///
+    /// * `config_fed` records the raw SPS/PPS bytes delivered with
+    ///   `is_config == true`, and `config_fed_before_first_frame` records
+    ///   whether that delivery happened before any media (`is_config == false`)
+    ///   unit was decoded. A config unit yields no drawable frame (empty
+    ///   buffer), exactly as a real decoder fed pure SPS/PPS would.
+    /// * `decoded` captures every byte run delivered as a media unit, in order.
+    /// * `configured_with` still records `configure()` calls so tests can assert
+    ///   the header/pipeline path configured the decoder from the stream
+    ///   geometry; the stream driver no longer calls `configure()` for the
+    ///   config unit (it flows through `decode_unit` instead).
     #[derive(Default)]
     struct FakeDecoder {
         configured_with: Vec<VideoConfig>,
@@ -1047,33 +1039,34 @@ mod tests {
         config_fed: Vec<Vec<u8>>,
         config_fed_before_first_frame: bool,
         first_frame_seen: bool,
-        /// Extradata recorded by the most recent `configure()` call, used to
-        /// recognize the config feed that immediately follows it.
-        last_configured_extra: Option<Vec<u8>>,
     }
 
     impl VideoDecoder for FakeDecoder {
         fn configure(&mut self, config: &VideoConfig) -> CoreResult<()> {
             self.configured_with.push(config.clone());
-            // A non-empty extradata marks a config (SPS/PPS) access unit; the
-            // stream driver feeds those same bytes through decode() next.
-            if !config.extra_data.is_empty() {
-                self.last_configured_extra = Some(config.extra_data.clone());
-            }
             Ok(())
         }
 
-        fn decode(&mut self, encoded: &[u8]) -> CoreResult<DecodedFrame> {
-            self.decoded.push(encoded.to_vec());
-            // If the bytes match the extradata from the preceding configure(),
-            // this is the config feed, not a real frame. Like a real decoder
-            // fed pure SPS/PPS, it produces no drawable frame (empty buffer).
-            if self.last_configured_extra.as_deref() == Some(encoded) {
+        fn decode(&mut self, _encoded: &[u8]) -> CoreResult<DecodedFrame> {
+            // The stream driver delivers access units via decode_unit; decode()
+            // is never reached on this path. Fail loudly if the seam regresses.
+            panic!("FakeDecoder expects the decode_unit seam, not decode()");
+        }
+
+        fn decode_unit(
+            &mut self,
+            encoded: &[u8],
+            is_config: bool,
+            _is_keyframe: bool,
+        ) -> CoreResult<DecodedFrame> {
+            if is_config {
+                // A config (SPS/PPS) unit: record that it reached the decoder,
+                // and whether it arrived before the first media frame. Like a
+                // real decoder fed pure SPS/PPS, it produces no drawable frame.
                 self.config_fed.push(encoded.to_vec());
                 if !self.first_frame_seen {
                     self.config_fed_before_first_frame = true;
                 }
-                self.last_configured_extra = None;
                 return Ok(DecodedFrame {
                     width: 2,
                     height: 2,
@@ -1082,6 +1075,7 @@ mod tests {
                 });
             }
             self.first_frame_seen = true;
+            self.decoded.push(encoded.to_vec());
             Ok(DecodedFrame {
                 width: 2,
                 height: 2,
@@ -1275,9 +1269,9 @@ mod tests {
         let stream = synthetic_stream(
             true,
             &[
-                (true, &[0x67, 0x42, 0x00][..]),  // config (SPS/PPS)
-                (false, &[0x65, 0x88][..]),        // keyframe-ish frame
-                (false, &[0x41, 0x9A][..]),        // delta frame
+                (true, &[0x67, 0x42, 0x00][..]), // config (SPS/PPS)
+                (false, &[0x65, 0x88][..]),      // keyframe-ish frame
+                (false, &[0x41, 0x9A][..]),      // delta frame
             ],
         );
         let mut cursor = std::io::Cursor::new(stream);
@@ -1291,28 +1285,21 @@ mod tests {
         assert_eq!(header.width, 1080);
         assert_eq!(header.height, 2400);
 
-        // The decoder was configured first from the header (dimensions, no
-        // extradata), then again from the config access unit (with the SPS/PPS
-        // extradata).
-        assert_eq!(decoder.configured_with.len(), 2);
+        // The decoder was configured ONCE from the header (dimensions, no
+        // extradata). The config access unit is no longer delivered via a
+        // separate configure() call: it now flows through the decode_unit seam
+        // as data, so there is exactly one configure().
+        assert_eq!(decoder.configured_with.len(), 1);
         assert_eq!(decoder.configured_with[0].width, 1080);
         assert_eq!(decoder.configured_with[0].height, 2400);
         assert!(decoder.configured_with[0].extra_data.is_empty());
-        assert_eq!(
-            decoder.configured_with[1].extra_data,
-            vec![0x67, 0x42, 0x00]
-        );
 
-        // The SPS/PPS config bytes are now DELIVERED to the decode path (to
-        // prime the h264 parser) ahead of the two real access units, so the
-        // decode() inputs are the config bytes followed by the two frames.
-        assert_eq!(
-            decoder.decoded,
-            vec![vec![0x67, 0x42, 0x00], vec![0x65, 0x88], vec![0x41, 0x9A]]
-        );
-        // The config bytes reached the decoder before the first real frame.
+        // The SPS/PPS config bytes were DELIVERED through decode_unit with
+        // is_config=true before any media unit, and only the two media units
+        // were decoded (is_config=false), in order.
         assert_eq!(decoder.config_fed, vec![vec![0x67, 0x42, 0x00]]);
         assert!(decoder.config_fed_before_first_frame);
+        assert_eq!(decoder.decoded, vec![vec![0x65, 0x88], vec![0x41, 0x9A]]);
 
         // Only the two drawable (non-config) frames reached the sink, in order;
         // the config feed produced an empty frame that was skipped.
@@ -1322,15 +1309,136 @@ mod tests {
         assert_eq!(frames[1].data, vec![0x41, 0x9A]);
     }
 
+    /// A fake decoder that EMULATES the native engine's packet_merger contract
+    /// through the `decode_unit` seam: a config (SPS/PPS) unit is REMEMBERED (no
+    /// frame produced yet), and the next media unit is decoded with the config
+    /// bytes PREPENDED to it, exactly as scrcpy's packet_merger does inside
+    /// `fb_decoder_feed`. It records the byte buffer actually "sent to the
+    /// decoder" for each media unit so a test can assert the config bytes were
+    /// merged in front of the first frame and never dropped.
+    #[derive(Default)]
+    struct MergingDecoder {
+        pending_config: Option<Vec<u8>>,
+        sent_to_codec: Vec<Vec<u8>>,
+    }
+
+    impl VideoDecoder for MergingDecoder {
+        fn configure(&mut self, _config: &VideoConfig) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn decode(&mut self, _encoded: &[u8]) -> CoreResult<DecodedFrame> {
+            // The native backend never routes media through decode(); it uses
+            // decode_unit below. Fail loudly if the seam regresses to decode().
+            panic!("MergingDecoder expects the decode_unit seam, not decode()");
+        }
+
+        fn decode_unit(
+            &mut self,
+            encoded: &[u8],
+            is_config: bool,
+            _is_keyframe: bool,
+        ) -> CoreResult<DecodedFrame> {
+            if is_config {
+                // Remember the config unit; no drawable frame yet.
+                self.pending_config = Some(encoded.to_vec());
+                return Ok(DecodedFrame {
+                    width: 0,
+                    height: 0,
+                    pixel_format: "rgba".to_string(),
+                    data: Vec::new(),
+                });
+            }
+            // Media unit: prepend any pending config bytes, then "decode".
+            let mut merged = Vec::new();
+            if let Some(cfg) = self.pending_config.take() {
+                merged.extend_from_slice(&cfg);
+            }
+            merged.extend_from_slice(encoded);
+            self.sent_to_codec.push(merged.clone());
+            Ok(DecodedFrame {
+                width: 2,
+                height: 2,
+                pixel_format: "rgba".to_string(),
+                data: merged,
+            })
+        }
+
+        fn flush(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// The config-prepend delivery contract: a config (SPS/PPS) access unit must
+    /// reach the decoder as DATA and be PREPENDED to the next media packet, NOT
+    /// dropped and NOT delivered as a separate configure()-with-empty-dims call.
+    /// This is the exact correctness fix for the
+    /// `send_packet: invalid data found when processing input` error. The test
+    /// drives a merging decoder (which emulates the native packet_merger) and
+    /// asserts the FIRST media unit the decoder actually processed begins with
+    /// the config bytes. If stream_av_packets ever drops the config unit or
+    /// stops routing it through decode_unit, the merged buffer would be missing
+    /// the SPS/PPS prefix and this test fails.
+    #[test]
+    fn config_unit_is_prepended_to_next_media_packet() {
+        let sps_pps: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0x68, 0xCE];
+        let keyframe: &[u8] = &[0x65, 0x88, 0x84];
+        let stream = synthetic_stream(
+            false,
+            &[
+                (true, sps_pps),            // config (SPS/PPS) unit
+                (false, keyframe),          // first media (keyframe) unit
+                (false, &[0x41, 0x9A][..]), // a delta frame, no config pending
+            ],
+        );
+        let mut cursor = std::io::Cursor::new(stream);
+        // Skip the header the same way stream_video does, then drive the loop.
+        let _header = parse_video_header(&mut cursor).unwrap();
+        let mut decoder = MergingDecoder::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        stream_av_packets(&mut cursor, &mut decoder, &tx, &never_cancel).unwrap();
+        drop(tx);
+
+        // The config unit produced NO frame, so only the two media units reach
+        // the sink, and the FIRST one carries the SPS/PPS prefix.
+        assert_eq!(
+            decoder.sent_to_codec.len(),
+            2,
+            "both media units should be sent to the codec"
+        );
+        let first = &decoder.sent_to_codec[0];
+        assert!(
+            first.starts_with(sps_pps),
+            "the config (SPS/PPS) bytes must be PREPENDED to the first media \
+             packet; got {first:02X?}"
+        );
+        assert_eq!(
+            first,
+            &[sps_pps, keyframe].concat(),
+            "the first codec packet must be exactly [SPS/PPS][keyframe]"
+        );
+        // The second media unit has no pending config, so it is sent as-is.
+        assert_eq!(decoder.sent_to_codec[1], vec![0x41, 0x9A]);
+
+        // Only the two non-empty (drawable) frames reached the sink.
+        let frames: Vec<DecodedFrame> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2, "only drawable frames reach the sink");
+        assert!(
+            frames[0].data.starts_with(sps_pps),
+            "the first drawable frame was decoded from the merged packet"
+        );
+    }
+
     #[test]
     fn stream_video_feeds_config_spspps_to_decoder_before_first_frame() {
         // Root-cause regression guard: a config (SPS/PPS) access unit followed
-        // by a single frame. The SPS/PPS bytes MUST reach the decoder (via
-        // decode()) before the first real frame is decoded, otherwise the libav
-        // h264 decoder has no context and the first frame fails with
-        // AVERROR_INVALIDDATA (the exact bug this fixes). Reverting the fix so
-        // the config branch merely records extradata and drops the bytes makes
-        // config_fed empty and fails this test.
+        // by a single frame. The SPS/PPS bytes MUST reach the decoder (via the
+        // decode_unit seam, with is_config=true) before the first media frame
+        // is decoded, otherwise a real decoder has no context and the first
+        // frame fails with AVERROR_INVALIDDATA (the exact bug this fixes).
+        // Reverting the fix so the config branch drops the bytes or stops
+        // routing them through decode_unit makes config_fed empty and fails
+        // this test.
         let stream = synthetic_stream(
             false,
             &[
@@ -1345,22 +1453,21 @@ mod tests {
         stream_video(&mut cursor, false, &mut decoder, &tx).unwrap();
         drop(tx);
 
-        // (a) The SPS/PPS config bytes were delivered to the decoder.
+        // (a) The SPS/PPS config bytes were delivered to the decoder through
+        // the decode_unit seam (with is_config=true), not dropped.
         assert_eq!(
             decoder.config_fed,
             vec![vec![0x67, 0x42, 0x00, 0x1F]],
             "the config SPS/PPS bytes must be fed to the decoder, not dropped"
         );
-        // (b) That delivery happened BEFORE the first real frame was decoded.
+        // (b) That delivery happened BEFORE the first media frame was decoded.
         assert!(
             decoder.config_fed_before_first_frame,
             "SPS/PPS must reach the decoder before the first frame is decoded"
         );
-        // The config bytes precede the frame in the decode input order.
-        assert_eq!(
-            decoder.decoded,
-            vec![vec![0x67, 0x42, 0x00, 0x1F], vec![0x65, 0x88]]
-        );
+        // Only the media unit was delivered via decode_unit with is_config=false
+        // (the config unit is tracked separately in config_fed, not decoded).
+        assert_eq!(decoder.decoded, vec![vec![0x65, 0x88]]);
         // Only the single drawable frame reached the sink (the config feed
         // produced an empty frame and was skipped).
         let frames: Vec<DecodedFrame> = rx.try_iter().collect();
@@ -1417,7 +1524,10 @@ mod tests {
         drop(tx);
 
         let frames: Vec<DecodedFrame> = rx.try_iter().collect();
-        assert!(frames.is_empty(), "empty decoder output must not be forwarded");
+        assert!(
+            frames.is_empty(),
+            "empty decoder output must not be forwarded"
+        );
     }
 
     #[test]
