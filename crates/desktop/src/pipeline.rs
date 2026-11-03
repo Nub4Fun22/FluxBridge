@@ -1424,12 +1424,7 @@ fn run_stream(
     }
 
     // Configure the decoder from the header, then run the access-unit loop.
-    let config_video = fluxbridge_core::VideoConfig {
-        codec: "h264".to_string(),
-        width: header.width,
-        height: header.height,
-        extra_data: Vec::new(),
-    };
+    let config_video = crate::scrcpy::video_config_from_header(&header);
     if let Err(e) = fluxbridge_core::VideoDecoder::configure(&mut decoder, &config_video) {
         report(status, PipelineStatus::Error(e.to_string()));
         return Ok(());

@@ -423,12 +423,7 @@ pub fn stream_video<R: Read>(
     let header = parse_video_header(reader)
         .map_err(|e| fluxbridge_core::CoreError::Other(format!("scrcpy video header: {e}")))?;
 
-    let config = VideoConfig {
-        codec: codec_name(header.codec_id),
-        width: header.width,
-        height: header.height,
-        extra_data: Vec::new(),
-    };
+    let config = video_config_from_header(&header);
     decoder.configure(&config)?;
 
     stream_av_packets(reader, decoder, frame_sink, &never_cancel)?;
@@ -523,12 +518,28 @@ pub fn stream_av_packets<R: Read>(
     }
 }
 
+/// Build the decoder [`VideoConfig`] from a parsed scrcpy [`VideoHeader`].
+///
+/// This is the single source of truth for how a header maps onto decoder
+/// config, so the all-in-one [`stream_video`] path and the staged
+/// `run_pipeline_full` path cannot drift. In particular the codec is always
+/// derived from `header.codec_id` via [`codec_name`], never pinned to a
+/// constant, so an h265/av1 session opens the right decoder.
+pub(crate) fn video_config_from_header(header: &VideoHeader) -> VideoConfig {
+    VideoConfig {
+        codec: codec_name(header.codec_id),
+        width: header.width,
+        height: header.height,
+        extra_data: Vec::new(),
+    }
+}
+
 /// Human-readable codec name for a scrcpy fourcc `u32`.
 ///
 /// scrcpy encodes the codec as a four-character code (for example `h264`).
 /// Unknown codes fall back to `"h264"` since that is the only codec FluxBridge
 /// requests from the server today.
-fn codec_name(codec_id: u32) -> String {
+pub(crate) fn codec_name(codec_id: u32) -> String {
     let bytes = codec_id.to_be_bytes();
     match &bytes {
         b"h264" => "h264".to_string(),
@@ -1547,5 +1558,39 @@ mod tests {
         assert_eq!(codec_name(fourcc(b"h265")), "h265");
         // Unknown falls back to h264.
         assert_eq!(codec_name(fourcc(b"zzzz")), "h264");
+    }
+
+    #[test]
+    fn video_config_derives_codec_from_header_not_a_constant() {
+        // Both the all-in-one `stream_video` path and the staged
+        // `run_pipeline_full` path build the decoder config through this one
+        // helper, so this guards against the codec being re-pinned to a
+        // literal (the h265/av1 mis-decode regression).
+        let make = |fcc: &[u8; 4]| VideoHeader {
+            device_name: "pixel".to_string(),
+            codec_id: fourcc(fcc),
+            width: 1080,
+            height: 1920,
+        };
+
+        let h264 = video_config_from_header(&make(b"h264"));
+        assert_eq!(h264.codec, "h264");
+        assert_eq!(h264.width, 1080);
+        assert_eq!(h264.height, 1920);
+
+        // The codec must track the header: an h265 header yields an h265
+        // config, which a hardcoded "h264" could never produce.
+        assert_eq!(video_config_from_header(&make(b"h265")).codec, "h265");
+        assert_eq!(video_config_from_header(&make(b"av01")).codec, "av1");
+
+        // And the derived string equals the header-driven `codec_name`, never a
+        // fixed value, across the full fourcc set.
+        for fcc in [b"h264", b"h265", b"av01", b"zzzz"] {
+            let header = make(fcc);
+            assert_eq!(
+                video_config_from_header(&header).codec,
+                codec_name(header.codec_id),
+            );
+        }
     }
 }
