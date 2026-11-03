@@ -135,10 +135,44 @@ impl VideoDecoder for StubDecoder {
 /// `Packet` to the libav H.264 decoder and converts the first decoded frame to
 /// a tightly packed RGBA buffer with `swscale`, which is directly usable as a
 /// `slint::Image` (`SharedPixelBuffer<Rgba8Pixel>`).
+///
+/// A `Send` newtype around the swscale scaling context.
+///
+/// `ffmpeg_next::software::scaling::Context` wraps a raw `*mut SwsContext`,
+/// which is not `Send`, so holding one directly inside [`FfmpegDecoder`] would
+/// make the whole decoder non-`Send` and break the `VideoDecoder: Send` bound
+/// the pipeline relies on (the decoder is moved onto a dedicated decode worker
+/// thread; see `crate::pipeline`).
+///
+/// # Safety
+///
+/// The `unsafe impl Send` below is sound HERE because of how the scaler is
+/// used, NOT because an swscale context is generally thread-safe:
+///
+/// * [`FfmpegDecoder`] owns its `SendScaler` exclusively (a private
+///   `Option<SendScaler>` field); it is never shared, cloned, aliased, or
+///   wrapped in an `Arc`/reference handed to another thread.
+/// * The scaler is only ever touched from the single decode worker thread
+///   inside [`FfmpegDecoder::decode`]; there is no concurrent access from two
+///   threads at any time.
+/// * The only cross-thread action is MOVING the owning `FfmpegDecoder` (and
+///   with it the pointer) onto the worker thread once, before any use. libav's
+///   libswscale contexts are not safe for CONCURRENT use from multiple threads,
+///   but an exclusive move followed by single-threaded use is fine: the raw
+///   `*mut SwsContext` is just an owned heap handle with no thread affinity.
+#[cfg(feature = "decode")]
+struct SendScaler(ffmpeg_next::software::scaling::Context);
+
+// SAFETY: see the `SendScaler` doc comment above. The scaler is owned
+// exclusively by one `FfmpegDecoder`, used only from the single decode worker
+// thread, and merely moved (never shared) across the thread boundary.
+#[cfg(feature = "decode")]
+unsafe impl Send for SendScaler {}
+
 #[cfg(feature = "decode")]
 pub struct FfmpegDecoder {
     decoder: Option<ffmpeg_next::decoder::Video>,
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    scaler: Option<SendScaler>,
     /// The (width, height, pixel format) the cached `scaler` was built for.
     ///
     /// swscale contexts are created for a fixed source geometry and pixel
@@ -259,17 +293,20 @@ impl VideoDecoder for FfmpegDecoder {
         // (black/frozen video). Only the scaler is rebuilt here; the H264
         // decoder is deliberately reused across re-configures.
         if self.scaler_src != Some((w, h, src_format)) {
-            self.scaler = Some(
-                Scaler::get(src_format, w, h, Pixel::RGBA, w, h, Flags::BILINEAR).map_err(|e| {
+            let ctx = Scaler::get(src_format, w, h, Pixel::RGBA, w, h, Flags::BILINEAR)
+                .map_err(|e| {
                     fluxbridge_core::CoreError::Other(format!("create swscale context: {e}"))
-                })?,
-            );
+                })?;
+            self.scaler = Some(SendScaler(ctx));
             self.scaler_src = Some((w, h, src_format));
         }
-        let scaler = self
+        // Unwrap the `SendScaler` newtype to reach the underlying swscale
+        // context; see the `SendScaler` safety note for why wrapping is sound.
+        let scaler = &mut self
             .scaler
             .as_mut()
-            .expect("scaler was just created above");
+            .expect("scaler was just created above")
+            .0;
         let mut rgba = VideoFrame::empty();
         scaler
             .run(&decoded, &mut rgba)
