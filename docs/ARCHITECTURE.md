@@ -56,10 +56,43 @@ receiver or an RTP H.264 stream. In the core this is the `VideoCapture` trait,
 which yields `EncodedFrame` values and never exposes transport details.
 
 ### Decoder
-Turns encoded frames into displayable pixels. Production backends use FFmpeg
-with hardware acceleration: DXVA2 / D3D11VA on Windows, VA-API / VDPAU on Linux.
-Modeled by the `VideoDecoder` trait so no FFmpeg symbols leak into the portable
-core; the headless stubs return `NotImplemented`.
+Turns encoded frames into displayable pixels. Modeled by the `VideoDecoder`
+trait so no FFmpeg symbols leak into the portable core.
+
+The shipped v1 decode path (option 2b) is a NATIVE scrcpy decode engine rather
+than a from-scratch Rust reimplementation. FluxBridge previously reimplemented
+scrcpy's client-side demux/decode in pure Rust and hit an unresolved
+`send_packet: invalid data found when processing input`, caused by delivering
+the SPS/PPS config access unit through a separate `configure()` call instead of
+prepending it to the next media packet the way scrcpy does. The native engine
+fixes this by building on scrcpy's proven algorithm:
+
+- `native/scrcpy-decode/vendor/packet_merger.{c,h}` is vendored verbatim from
+  scrcpy v5.0.1 (Apache-2.0, include-only trim); it remembers a config packet
+  and prepends it to the next media packet so the decoder receives one
+  `[SPS/PPS][keyframe]` Annex-B `AVPacket`.
+- `native/scrcpy-decode/fb_decoder.c` reimplements scrcpy's `avcodec_send_packet`
+  + `avcodec_receive_frame` loop (with `AV_CODEC_FLAG_LOW_DELAY`) and the
+  swscale-to-RGBA conversion, exposed over a thin opaque C ABI (`fb_decoder.h`).
+- `crates/scrcpy-decode-sys` is the FFI crate; its `build.rs` compiles that C
+  with the `cc` crate and links the shared FFmpeg (avcodec/avformat/avutil/
+  swscale) from `FFMPEG_DIR`, but ONLY under its `build-native` feature so a
+  default build is a clean no-op.
+- `crates/desktop/src/decode_loop.rs::NativeScrcpyDecoder` implements
+  `VideoDecoder` over that FFI (behind the `native-decode` cargo feature), is
+  `Send`, and emits `DecodedFrame{ pixel_format: "rgba", data.len() == w*h*4 }`,
+  which the Slint UI (`ui.rs::attach_frame_sink` + `decoded_frame_to_image`)
+  renders via `SharedPixelBuffer<Rgba8Pixel>` into the EXISTING in-window
+  `frame` surface. There is no separate SDL/scrcpy window.
+
+Feature selection and precedence (`pipeline.rs`): `native-decode` wins over the
+older pure-Rust `decode` (ffmpeg-next) fallback, which in turn wins over the
+headless `StubDecoder`. Both FFmpeg-backed features are OFF by default and NOT
+implied by `gui`, so the headless Linux host (no FFmpeg, no display) keeps the
+`StubDecoder` and builds/tests/clippy stay green with zero native linkage. The
+`decode` path is kept in the tree as a fallback until the native engine is
+validated on Windows CI and by the user; the shipped Windows release builds
+`--features gui,native-decode`.
 
 ### Input Mapper
 Translates host input (mouse, keyboard, touch/pen) into the protocol's
@@ -128,11 +161,14 @@ unit-tested modules:
   build surfaces "adb not found" or "no device" without a console).
 
 This path feeds the same `VideoDecoder` trait abstraction described above: the
-scrcpy access units are fed straight to the decoder (the `decode` feature's
-FFmpeg backend, or the headless `StubDecoder`), which turns them into pixels for
-the Slint UI. The scrcpy sockets do NOT go through the FluxBridge `0xFB`
-`Connection` / `run_decode_loop` path; that path is retained only for a future
-FluxBridge-native server.
+scrcpy access units are fed straight to the decoder (the `native-decode`
+engine, the pure-Rust `decode` fallback, or the headless `StubDecoder`), which
+turns them into pixels for the Slint UI. A config (SPS/PPS) access unit is
+passed through `VideoDecoder::decode_unit` as DATA so the native engine's
+`packet_merger` prepends it to the next media packet, rather than through a
+`configure()` call with empty dimensions. The scrcpy sockets do NOT go through
+the FluxBridge `0xFB` `Connection` / `run_decode_loop` path; that path is
+retained only for a future FluxBridge-native server.
 
 ### Verification status (be honest)
 
@@ -140,14 +176,31 @@ The transport (`adb.rs`), the scrcpy framing and control encoders (`scrcpy.rs`),
 the pipeline's scrcpy-driven video path and control-sink handoff
 (`pipeline.rs`), and the decode seam (`decode_loop.rs`) are IMPLEMENTED and
 unit-tested headlessly: the stream driver runs against synthetic in-memory
-streams with a fake decoder, and the control sink is driven end to end through a
-fake writer. What has NOT been exercised here is a live device: the headless
-Linux CI host has no Android phone, no adb, no FFmpeg development libraries, and
-no display, so real end-to-end mirroring and input injection are wired but must
-be verified by the user on Windows with a phone attached (build
-`--features gui,decode`, ship the scrcpy server jar next to the `.exe`, connect a
-device, and click Start). Do not read "implemented" as "field-verified on a
-device" for the live streaming path.
+streams with a fake decoder (including a test that the SPS/PPS config unit
+reaches the decoder before the first frame and is merged, not dropped), and the
+control sink is driven end to end through a fake writer.
+
+The native decode engine has a THREE-TIER verification reality, and only the
+first tier is exercised on this headless Linux host:
+
+- Headless Linux (this host): the DEFAULT and `gui` builds, with
+  `native-decode` OFF, compile/link/test/clippy green with ZERO FFmpeg or
+  vendored-C linkage, because the `StubDecoder` is selected. All the native
+  sequencing/state/framing logic that CAN be exercised without FFmpeg (the
+  config-prepend delivery contract, the rgba `DecodedFrame` length invariant via
+  a feed/take fake, the USB status reporting) is pure Rust and unit-tested with
+  the feature OFF. The `scrcpy-decode-sys` crate builds as a no-op FFI-only
+  crate here; `--features build-native` type-checks its `build.rs` and invokes
+  `cc` on the vendored C, failing only at the absent `libavcodec/avcodec.h`.
+- windows-latest CI: the native C compile (the `cc` crate against MSVC) plus the
+  FFmpeg link (the provisioned pinned BtbN FFmpeg 7.1.3 shared build) and the
+  installer/zip packaging happen here under `--features gui,native-decode`. This
+  cannot be reproduced on the headless host.
+- The user's device (Samsung SM-F946B / Fold5, Android 17): real pixels
+  rendering in the in-window Slint surface and working USB mirroring can be
+  confirmed only by the user running the shipped build against a phone. Do not
+  read "implemented" as "field-verified on a device"; the first in-window render
+  may need refinement.
 
 ### Two wire formats, kept distinct
 

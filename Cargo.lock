@@ -1165,6 +1165,7 @@ dependencies = [
  "fluxbridge-core",
  "fluxbridge-updater",
  "png 0.17.16",
+ "scrcpy-decode-sys",
  "serde",
  "serde_json",
  "slint",
@@ -3732,6 +3733,13 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scrcpy-decode-sys"
+version = "0.4.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "sctk-adwaita"
