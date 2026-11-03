@@ -298,6 +298,23 @@ pub fn build_main_window(
         start_for_button(None);
     });
 
+    // Connect via USB: hide the menu and begin mirroring with an EXPLICIT USB
+    // transport, independent of the config's default transport. This runs the
+    // same reverse-tunnel run_pipeline_full path through the shared
+    // start_pipeline closure (Transport::Usb maps to DeviceSelector::UsbDefault
+    // via PipelineConfig::selector), so there is no duplicated spawn logic and
+    // the RunGuard still refuses an overlapping run. It is both a feature and a
+    // diagnostic: a working USB mirror next to a failing Wi-Fi one localizes the
+    // problem to the network/pairing side.
+    let weak = window.as_weak();
+    let connect_usb = Rc::clone(&start_pipeline);
+    window.on_connect_usb(move || {
+        let Some(w) = weak.upgrade() else { return };
+        w.set_menu_visible(false);
+        w.set_connection_status("Connecting via USB...".into());
+        connect_usb(Some(crate::pipeline::Transport::Usb));
+    });
+
     // Stop mirroring: end the current session and return to the Start menu
     // WITHOUT quitting the app (distinct from on_quit). Tripping ONLY the
     // current run's cancel flag makes the pipeline thread break its loop and run

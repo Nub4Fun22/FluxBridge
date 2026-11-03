@@ -261,6 +261,21 @@ pub fn mdns_check_args() -> Vec<String> {
     vec!["mdns".into(), "check".into()]
 }
 
+/// Build `adb start-server` to ensure the adb daemon is running. This is cheap
+/// and non-disruptive (a no-op when the daemon is already up), so it is safe to
+/// run best-effort before connecting. It takes no `-s` selector.
+pub fn start_server_args() -> Vec<String> {
+    vec!["start-server".into()]
+}
+
+/// Build `adb kill-server` to stop the adb daemon. This is disruptive to other
+/// adb users on the machine, so it must only be issued as a one-time recovery
+/// step after a connection-class failure, never unconditionally. It takes no
+/// `-s` selector.
+pub fn kill_server_args() -> Vec<String> {
+    vec!["kill-server".into()]
+}
+
 /// The mDNS service type of a discovered wireless-debugging endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MdnsServiceKind {
@@ -540,7 +555,13 @@ impl Default for ServerLaunchOptions {
             max_size: 0,
             bit_rate: 8_000_000,
             max_fps: 0,
-            tunnel_forward: true,
+            // Reverse tunneling is scrcpy's own default and the shipped
+            // FluxBridge default: the device connects OUT to a desktop
+            // listener, so the server never writes the forward-mode leading
+            // dummy byte and there is no forward-mode readiness race. The
+            // forward path (tunnel_forward=true) stays reachable when set
+            // explicitly.
+            tunnel_forward: false,
         }
     }
 }
@@ -1104,6 +1125,12 @@ mod tests {
     }
 
     #[test]
+    fn start_and_kill_server_args_exact() {
+        assert_eq!(start_server_args(), vec!["start-server"]);
+        assert_eq!(kill_server_args(), vec!["kill-server"]);
+    }
+
+    #[test]
     fn parse_mdns_services_captured_sample_distinguishes_connect_and_pairing() {
         // Representative captured `adb mdns services` output: a header line,
         // then a connect and a pairing service for the same device, with
@@ -1330,7 +1357,7 @@ mod tests {
                 "max_size=0",
                 "video_bit_rate=8000000",
                 "max_fps=0",
-                "tunnel_forward=true",
+                "tunnel_forward=false",
                 "audio=false",
                 "control=true",
             ]
