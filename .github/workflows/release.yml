@@ -70,9 +70,28 @@ jobs:
       #     ffmpeg-next v7 (ffmpeg-sys-next) compiles against the libav
       #     development headers/import libraries and uses bindgen/libclang, so
       #     it needs both an FFmpeg dev tree (FFMPEG_DIR) and libclang
-      #     (LIBCLANG_PATH). This mirrors the ffmpeg-next maintainer's own
-      #     Windows CI: set LIBCLANG_PATH from Visual Studio's bundled LLVM
-      #     (found via vswhere) and download a prebuilt SHARED FFmpeg build.
+      #     (LIBCLANG_PATH). It needs a REAL, x64 libclang: bindgen parses the
+      #     FFmpeg headers with libclang, and if libclang is missing or wrong
+      #     ffmpeg-sys-next silently falls back to PLACEHOLDER bindings where
+      #     every struct has size_of == 1. Those bindings still compile the
+      #     crate, but the generated compile-time size assertions like
+      #     ["Size of AVFormatContext"][size_of::<AVFormatContext>() - 472usize]
+      #     then try to compute 1usize - 472usize and the build dies with
+      #     error[E0080] "attempt to compute ... which would overflow". That is
+      #     exactly how the v0.7.0 release failed.
+      #
+      #     IMPORTANT (libclang provisioning): we do NOT use Visual Studio's
+      #     OPTIONAL bundled LLVM (the old VC\Tools\LLVM\x64\bin found via
+      #     vswhere). That component is not reliably installed on the hosted
+      #     windows-latest runner, and when it is absent LIBCLANG_PATH pointed at
+      #     a nonexistent/unusable libclang, which is the root cause of the
+      #     placeholder-bindings E0080 failure above. Instead we provision a
+      #     standalone x64 LLVM at the well-known C:\Program Files\LLVM\bin: use
+      #     the runner's preinstalled LLVM there if present, otherwise install it
+      #     via Chocolatey (choco install llvm, an x64 package that matches the
+      #     x64 build target). This is the known-good recipe for ffmpeg-sys-next
+      #     bindgen on windows-latest and is deterministic. We then download a
+      #     prebuilt SHARED FFmpeg build (below) for FFMPEG_DIR.
       #
       #     PINNED FFmpeg 7.x.  The crate is ffmpeg-next 7.1.0 (ffmpeg-sys-next
       #     7.x), whose generated bindings target the FFmpeg 7 ABI. A rolling
@@ -109,15 +128,29 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # bindgen/libclang: point at Visual Studio's bundled LLVM via vswhere.
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsInstall = & $vswhere -latest -property installationPath
-          if (-not $vsInstall) {
-            throw "Could not locate a Visual Studio installation via vswhere; LIBCLANG_PATH cannot be set for ffmpeg-sys-next (bindgen)."
+          # bindgen/libclang: provision a REAL x64 libclang at the well-known
+          # standalone LLVM location C:\Program Files\LLVM\bin. We deliberately
+          # do NOT use Visual Studio's optional bundled LLVM (VC\Tools\LLVM) via
+          # vswhere: that component is not reliably present on windows-latest, and
+          # when it is missing bindgen falls back to placeholder bindings and the
+          # decode build fails with the E0080 size-assertion overflow (see the
+          # step comment above). Prefer the runner's preinstalled LLVM if it is
+          # already there, otherwise install the x64 LLVM package via Chocolatey.
+          $libclangPath = "C:\Program Files\LLVM\bin"
+          if (Test-Path (Join-Path $libclangPath "libclang.dll")) {
+            Write-Host "Found a preinstalled LLVM at $libclangPath; using it for libclang."
+          } else {
+            Write-Host "No LLVM at $libclangPath; installing the x64 LLVM package via Chocolatey for ffmpeg-sys-next bindgen."
+            choco install llvm --no-progress --yes
+            if ($LASTEXITCODE -ne 0) {
+              throw "choco install llvm failed (exit $LASTEXITCODE); cannot provide libclang for ffmpeg-sys-next (bindgen)."
+            }
           }
-          $libclangPath = Join-Path $vsInstall "VC\Tools\LLVM\x64\bin"
+          # Hard gate: the x64 libclang.dll MUST exist at the chosen path, or
+          # bindgen will emit placeholder bindings and the decode build will fail
+          # with error[E0080] size-assertion overflows. Fail early and clearly.
           if (-not (Test-Path (Join-Path $libclangPath "libclang.dll"))) {
-            throw "libclang.dll not found under '$libclangPath'. The VS bundled LLVM component is required for ffmpeg-sys-next bindgen."
+            throw "libclang.dll not found under '$libclangPath' after LLVM provisioning. A real x64 libclang is required for ffmpeg-sys-next bindgen; without it bindgen falls back to placeholder bindings and the decode build fails with error[E0080] size-assertion overflows."
           }
 
           # Download the PINNED SHARED FFmpeg build (versioned, immutable URL).
