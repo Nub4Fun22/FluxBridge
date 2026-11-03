@@ -117,6 +117,16 @@ Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; .github/workflows/release.yml). scrcpy's MIT LICENSE is shipped alongside it.
 Source: "..\target\release\scrcpy-server.jar"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\scrcpy-server-LICENSE"; DestDir: "{app}"; DestName: "scrcpy-server-LICENSE.txt"; Flags: ignoreversion
+; Ship the FFmpeg shared-build runtime DLLs NEXT TO the .exe. The release
+; build enables the `decode` feature (cargo build --features gui,decode), which
+; links a SHARED FFmpeg via ffmpeg-next, so the avcodec/avformat/avutil/swscale/
+; swresample (and avfilter/avdevice/postproc) DLLs MUST live in {app} beside
+; fluxbridge-desktop.exe or Windows cannot start the process. CI stages every
+; DLL from the provisioned ffmpeg\bin into ..\target\release (see
+; .github/workflows/release.yml), and this glob bundles all of them, which is
+; robust to FFmpeg's per-release DLL version suffixes (avcodec-61, avutil-59,
+; swscale-8, and so on).
+Source: "..\target\release\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 ; ---------------------------------------------------------------------------
 ; [Icons]

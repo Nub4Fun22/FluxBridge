@@ -66,6 +66,78 @@ jobs:
           $version = "${{ github.ref_name }}" -replace '^v', ''
           "FLUXBRIDGE_RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # 3c. Provision a prebuilt SHARED FFmpeg so the `decode` feature links.
+      #     ffmpeg-next v7 (ffmpeg-sys-next) compiles against the libav
+      #     development headers/import libraries and uses bindgen/libclang, so
+      #     it needs both an FFmpeg dev tree (FFMPEG_DIR) and libclang
+      #     (LIBCLANG_PATH). This mirrors the ffmpeg-next maintainer's own
+      #     Windows CI: set LIBCLANG_PATH from Visual Studio's bundled LLVM
+      #     (found via vswhere) and download the gyan.dev
+      #     ffmpeg-release-full-shared build (FFmpeg 7.x, matching ffmpeg-next
+      #     7.1.0). Because it is a SHARED build the avcodec/avformat/avutil/
+      #     swscale/swresample (plus avfilter/avdevice/postproc) DLLs it ships
+      #     in ffmpeg\bin MUST travel next to fluxbridge-desktop.exe at runtime
+      #     (staged into target\release by a later step), or the app will not
+      #     start. The extracted folder is versioned (ffmpeg-*), so it is
+      #     normalized into a stable `ffmpeg` directory to keep FFMPEG_DIR and
+      #     the bin\ PATH entry deterministic. The guard fails the job early -
+      #     in the same defensive style as the scrcpy jar validation below - if
+      #     the download or extraction did not produce a usable ffmpeg\bin with
+      #     avcodec*.dll.
+      - name: Provision FFmpeg (shared) for the decode feature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # bindgen/libclang: point at Visual Studio's bundled LLVM via vswhere.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -property installationPath
+          if (-not $vsInstall) {
+            throw "Could not locate a Visual Studio installation via vswhere; LIBCLANG_PATH cannot be set for ffmpeg-sys-next (bindgen)."
+          }
+          $libclangPath = Join-Path $vsInstall "VC\Tools\LLVM\x64\bin"
+          if (-not (Test-Path (Join-Path $libclangPath "libclang.dll"))) {
+            throw "libclang.dll not found under '$libclangPath'. The VS bundled LLVM component is required for ffmpeg-sys-next bindgen."
+          }
+
+          # Download and extract the gyan.dev prebuilt SHARED FFmpeg build.
+          $ffmpegRoot = "$env:RUNNER_TEMP\ffmpeg-dl"
+          New-Item -ItemType Directory -Force -Path $ffmpegRoot | Out-Null
+          $archive = Join-Path $ffmpegRoot "ffmpeg-release-full-shared.7z"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" `
+            -OutFile $archive
+          if (-not (Test-Path $archive)) {
+            throw "FFmpeg download failed: ffmpeg-release-full-shared.7z was not written to $archive."
+          }
+
+          # windows-latest ships 7z (7z.exe) preinstalled.
+          7z x $archive "-o$ffmpegRoot" -y | Out-Null
+
+          # Normalize the versioned extracted dir (ffmpeg-*-full_build-shared)
+          # into a stable `ffmpeg` directory so FFMPEG_DIR is deterministic.
+          $ffmpegDir = Join-Path $ffmpegRoot "ffmpeg"
+          if (Test-Path $ffmpegDir) { Remove-Item -Recurse -Force $ffmpegDir }
+          $extracted = Get-ChildItem -Path $ffmpegRoot -Directory |
+            Where-Object { $_.Name -like "ffmpeg-*" } | Select-Object -First 1
+          if (-not $extracted) {
+            throw "FFmpeg extraction failed: no 'ffmpeg-*' directory found under $ffmpegRoot."
+          }
+          Rename-Item -Path $extracted.FullName -NewName "ffmpeg"
+
+          # Guard: the shared build MUST contain the runtime DLLs in bin\.
+          $binDir = Join-Path $ffmpegDir "bin"
+          $avcodec = Get-ChildItem -Path $binDir -Filter "avcodec*.dll" -ErrorAction SilentlyContinue
+          if (-not $avcodec) {
+            throw "FFmpeg provisioning looks broken: no avcodec*.dll found in '$binDir'. The decode feature cannot link or run without the shared FFmpeg DLLs."
+          }
+
+          # Export FFMPEG_DIR + LIBCLANG_PATH for the build, and add ffmpeg\bin
+          # to PATH so the DLLs resolve during any tooling that runs the exe.
+          "FFMPEG_DIR=$ffmpegDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $binDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "FFmpeg provisioned at $ffmpegDir (bin has $($avcodec.Name)); LIBCLANG_PATH=$libclangPath."
+
       # 4. Build the optimized production binary.
       #    LTO and stripped debug symbols come from [profile.release] in the
       #    workspace Cargo.toml (lto=true, codegen-units=1, strip=true,
@@ -77,18 +149,43 @@ jobs:
       #    FLUXBRIDGE_RELEASE_VERSION (set in the previous step) flows into
       #    build.rs so the binary self-reports the tag version.
       #
-      #    For v1 this builds `--features gui` and intentionally does NOT enable
-      #    `decode`. The real FFmpeg H.264 decode path (the `decode` feature,
-      #    backed by ffmpeg-next) needs libav development libraries on the
-      #    runner. Provisioning them is a documented follow-up: add a step that
-      #    installs FFmpeg dev libs via vcpkg (for example
-      #    `vcpkg install ffmpeg:x64-windows`) and exports the environment
-      #    variables ffmpeg-next needs (FFMPEG_DIR / PKG_CONFIG_PATH), then
-      #    build with `--features gui,decode`. Keeping decode off here lets the
-      #    release link without FFmpeg provisioning while the icon, GUI and
-      #    installer paths are exercised end to end.
-      - name: Build release binary (GUI)
-        run: cargo build --release --features gui --bin fluxbridge-desktop
+      #    This ships BOTH `gui` and `decode`: the real FFmpeg H.264 decode path
+      #    (the `decode` feature, backed by ffmpeg-next) is now part of the
+      #    Windows release, so mirrored frames are decoded to real pixels
+      #    instead of the pure-Rust StubDecoder's empty output. The preceding
+      #    "Provision FFmpeg (shared)" step makes ffmpeg-next link by setting
+      #    FFMPEG_DIR and LIBCLANG_PATH; the following "Stage FFmpeg runtime
+      #    DLLs" step copies the shared-build DLLs next to the exe so it runs.
+      #    `decode` is still OFF by default and NOT implied by `gui`, so the
+      #    headless `cargo build --workspace` / `--features gui` builds stay
+      #    green with no libav dependency.
+      - name: Build release binary (GUI + decode)
+        run: cargo build --release --features gui,decode --bin fluxbridge-desktop
+
+      # 4a. Stage the FFmpeg shared-build runtime DLLs next to the exe.
+      #     The decode feature links a SHARED FFmpeg, so the avcodec/avformat/
+      #     avutil/swscale/swresample (and avfilter/avdevice/postproc) DLLs must
+      #     sit beside fluxbridge-desktop.exe at runtime or Windows fails to
+      #     start the process. Copy every *.dll from the provisioned
+      #     ffmpeg\bin into target\release so both the portable zip and the
+      #     installer pick them up from there. Globbing all DLLs is robust to
+      #     FFmpeg's per-release version suffixes (avcodec-61, avutil-59, etc.).
+      #     The guard fails the job if the core libav DLLs did not land.
+      - name: Stage FFmpeg runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binDir = Join-Path $env:FFMPEG_DIR "bin"
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          Copy-Item -Path (Join-Path $binDir "*.dll") -Destination target\release -Force
+          foreach ($prefix in @("avcodec", "avutil", "avformat", "swscale")) {
+            $found = Get-ChildItem -Path target\release -Filter "$prefix*.dll" -ErrorAction SilentlyContinue
+            if (-not $found) {
+              throw "FFmpeg DLL staging incomplete: no $prefix*.dll in target\release. The decode build would not run without the shared FFmpeg runtime DLLs beside the exe."
+            }
+          }
+          $dlls = Get-ChildItem -Path target\release -Filter "*.dll"
+          Write-Host "Staged $($dlls.Count) FFmpeg DLLs into target\release: $(( $dlls | ForEach-Object { $_.Name } ) -join ', ')."
 
       # 4b. Obtain the upstream scrcpy server jar and stage it next to the .exe.
       #     The mirroring pipeline pushes this jar to the device and resolves it
@@ -169,9 +266,13 @@ jobs:
           }
           Write-Host "scrcpy server jar validated: $asset ($size bytes)."
 
-      # 5. Package the portable .zip containing the built .exe AND the scrcpy
-      #    server jar beside it, so the portable build can mirror without a
-      #    separate download (resolve_server_jar looks next to the .exe).
+      # 5. Package the portable .zip containing the built .exe, the scrcpy
+      #    server jar beside it, AND the FFmpeg shared-build runtime DLLs, so
+      #    the portable build can mirror AND decode without a separate download
+      #    (resolve_server_jar looks next to the .exe, and Windows loads the
+      #    avcodec/avutil/etc. DLLs from the exe directory). The target\release
+      #    \*.dll glob picks up every FFmpeg DLL staged by the step above,
+      #    robust to FFmpeg's per-release version suffixes.
       #    github.ref_name is the tag that triggered the run (for example v1.2.0).
       - name: Package portable zip
         shell: pwsh
@@ -180,7 +281,8 @@ jobs:
           Compress-Archive `
             -Path target\release\fluxbridge-desktop.exe, `
                   target\release\scrcpy-server.jar, `
-                  target\release\scrcpy-server-LICENSE `
+                  target\release\scrcpy-server-LICENSE, `
+                  target\release\*.dll `
             -DestinationPath "dist\FluxBridge-${{ github.ref_name }}-portable.zip" `
             -Force
 

@@ -247,7 +247,7 @@ without changing any code:
 |-----------|---------|-----------------|----------------|
 | (none)    | yes     | Headless logic only: connection skeleton, decode loop driven by the pure-Rust `StubDecoder`, and updater wiring. Zero native/GUI/FFmpeg linkage. | Any host, including headless Linux CI. |
 | `gui`     | no      | Compiles and wires the Slint UI (winit backend, software renderer). Does **not** pull FFmpeg. | Links on both Linux and Windows. |
-| `decode`  | no      | Real FFmpeg H.264 decode via the `ffmpeg-next` crate, backing the real `VideoDecoder`. | Compiled and verified on **Windows only**. On headless Linux it may fail to link without the libav development packages, which is expected; leave it off there. |
+| `decode`  | no      | Real FFmpeg H.264 decode via the `ffmpeg-next` crate, backing the real `VideoDecoder`. **Now shipped in the Windows release** (the release job builds `--features gui,decode`), so mirrored frames are decoded to real pixels instead of the StubDecoder's empty output. | Compiled and verified on **Windows only**. On headless Linux it may fail to link without the libav development packages, which is expected; leave it off there. |
 
 Features compose, so a full Windows client build is:
 
@@ -292,8 +292,26 @@ the Start Menu and Desktop shortcuts.
 ### Windows FFmpeg (decode feature) requirement
 
 The `decode` feature links the real FFmpeg H.264 decoder through `ffmpeg-next`,
-which needs the libav development libraries at build time. On Windows the
-supported path is [vcpkg](https://github.com/microsoft/vcpkg):
+which needs the libav development libraries at build time and the matching
+shared-build runtime DLLs at run time.
+
+**In the shipped Windows release** (`.github/workflows/release.yml`) this is
+provisioned automatically. The release job downloads the gyan.dev prebuilt
+shared build (`ffmpeg-release-full-shared.7z`, FFmpeg 7.x, matching
+`ffmpeg-next` 7.1.0), normalizes it into a stable `ffmpeg` directory, and
+exports `FFMPEG_DIR` (so `ffmpeg-next` finds the headers and import libraries)
+and `LIBCLANG_PATH` (Visual Studio's bundled LLVM, needed because
+`ffmpeg-sys-next` runs bindgen/libclang). It then builds with
+`--features gui,decode`. Because this is a SHARED build, the runtime DLLs
+(`avcodec`, `avformat`, `avutil`, `swscale`, `swresample`, plus the
+`avfilter`/`avdevice`/`postproc` DLLs the `ffmpeg-next` default features pull)
+must sit next to `fluxbridge-desktop.exe` or Windows will not start the app, so
+CI copies every `*.dll` from `ffmpeg\bin` into the build output and bundles
+them in BOTH the portable zip and the Inno Setup installer, right beside the
+exe.
+
+**For a local Windows developer build** the supported path is
+[vcpkg](https://github.com/microsoft/vcpkg):
 
 ```sh
 vcpkg install ffmpeg:x64-windows
@@ -301,8 +319,11 @@ vcpkg install ffmpeg:x64-windows
 
 then point `ffmpeg-next` at it before building, for example by exporting
 `FFMPEG_DIR` (and `PKG_CONFIG_PATH`) to the vcpkg install tree, and build with
-`--features "gui decode"`. On the headless Linux build (and in the current CI
-release job) `decode` is left off, so no libav libraries are required there.
+`--features "gui decode"`. If you build against a shared FFmpeg locally,
+remember to place the same runtime DLLs next to the exe when you run it.
+
+On the headless Linux build (and the default/`gui`-only builds) `decode` is left
+off, so no libav libraries are required there.
 
 ### CARGO_HOME note for the sandbox / CI
 
