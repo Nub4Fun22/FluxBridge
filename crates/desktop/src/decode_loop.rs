@@ -25,6 +25,41 @@ use std::sync::mpsc::{Receiver, Sender};
 use fluxbridge_core::protocol::{Packet, PacketType};
 use fluxbridge_core::{CoreResult, DecodedFrame, VideoConfig, VideoDecoder};
 
+/// Copy a `width x height` RGBA image out of a buffer whose rows are
+/// `src_stride` bytes apart into a tightly packed `width*height*4` buffer.
+///
+/// `swscale` (and most image pipelines) align each output row to a stride that
+/// can be LARGER than the visible `width*4` bytes, leaving padding at the end of
+/// every row. The UI only draws a [`DecodedFrame`] whose
+/// `data.len() == width*height*4` (see
+/// [`crate::ui`]::`decoded_frame_to_image`), so the decoder must drop that
+/// padding before handing a frame off. This helper does exactly that: it reads
+/// `width*4` bytes from the start of each of the `height` rows and concatenates
+/// them, producing a contiguous buffer with no row padding.
+///
+/// It is intentionally a pure, NON-FFmpeg function (not behind the `decode`
+/// feature) so the stride math can be unit-tested on the headless Linux host
+/// without linking libav.
+///
+/// # Panics
+///
+/// Panics (via slice bounds) if `src` is not large enough to hold `height` rows
+/// of `src_stride` bytes, or if `src_stride < width*4`. Callers pass libav's own
+/// reported stride and frame geometry, which always satisfy these invariants.
+pub(crate) fn pack_rgba(src: &[u8], src_stride: usize, width: usize, height: usize) -> Vec<u8> {
+    let row_bytes = width * 4;
+    debug_assert!(
+        src_stride >= row_bytes,
+        "src_stride must be at least width*4"
+    );
+    let mut out = Vec::with_capacity(row_bytes * height);
+    for row in 0..height {
+        let start = row * src_stride;
+        out.extend_from_slice(&src[start..start + row_bytes]);
+    }
+    out
+}
+
 /// A stand-in software decoder.
 ///
 /// It does not actually decode H.264/HEVC; it wraps each encoded payload in a
@@ -104,6 +139,18 @@ impl VideoDecoder for StubDecoder {
 pub struct FfmpegDecoder {
     decoder: Option<ffmpeg_next::decoder::Video>,
     scaler: Option<ffmpeg_next::software::scaling::Context>,
+    /// The (width, height, pixel format) the cached `scaler` was built for.
+    ///
+    /// swscale contexts are created for a fixed source geometry and pixel
+    /// format. A phone mirror can change geometry mid-stream (device rotation,
+    /// or the Z Fold5 folding/unfolding), after which libav emits frames at the
+    /// NEW dimensions. If we kept a scaler built for the old geometry, its RGBA
+    /// output (and `pack_rgba`'s width*height*4 result) would no longer match
+    /// the frame the UI expects and every post-change frame would be dropped by
+    /// the UI length gate (black/frozen video). We compare each decoded frame's
+    /// geometry to this and rebuild the scaler when it differs. The H264
+    /// decoder itself is NOT rebuilt; only the scaler follows the frame.
+    scaler_src: Option<(u32, u32, ffmpeg_next::format::Pixel)>,
     width: u32,
     height: u32,
 }
@@ -117,6 +164,7 @@ impl FfmpegDecoder {
         Ok(FfmpegDecoder {
             decoder: None,
             scaler: None,
+            scaler_src: None,
             width: 0,
             height: 0,
         })
@@ -127,6 +175,31 @@ impl FfmpegDecoder {
 impl VideoDecoder for FfmpegDecoder {
     fn configure(&mut self, config: &VideoConfig) -> CoreResult<()> {
         use ffmpeg_next::codec::{context::Context, Id};
+
+        // stream_av_packets calls configure() twice with different intents:
+        //   1. ONCE up front from the parsed scrcpy header with the real device
+        //      dimensions set and empty extra_data; and
+        //   2. AGAIN for every is_config (SPS/PPS) access unit with width=0,
+        //      height=0 and extra_data=SPS/PPS.
+        // Only remember non-zero dimensions so a later zero-dim SPS/PPS re-config
+        // does not clobber the known-good header geometry. The decoded frame's
+        // real geometry always comes from decoded.width()/height() in decode(),
+        // so these fields are only the fallback reported on empty frames.
+        if config.width != 0 && config.height != 0 {
+            self.width = config.width;
+            self.height = config.height;
+        }
+
+        // If a working decoder already exists, do NOT tear it down on a
+        // re-configure. scrcpy sends raw Annex-B H.264, so SPS/PPS also arrive
+        // inline with each keyframe and the libav h264 parser picks them up from
+        // the stream itself; rebuilding the decoder (and dropping the scaler)
+        // mid-stream would needlessly discard warmed-up state. Build the decoder
+        // lazily only the first time.
+        if self.decoder.is_some() {
+            return Ok(());
+        }
+
         let codec = ffmpeg_next::decoder::find(Id::H264)
             .ok_or_else(|| fluxbridge_core::CoreError::Other("no H264 decoder".into()))?;
         let ctx = Context::new_with_codec(codec);
@@ -134,10 +207,9 @@ impl VideoDecoder for FfmpegDecoder {
             .decoder()
             .video()
             .map_err(|e| fluxbridge_core::CoreError::Other(format!("open h264 decoder: {e}")))?;
-        self.width = config.width;
-        self.height = config.height;
         self.decoder = Some(decoder);
         self.scaler = None;
+        self.scaler_src = None;
         Ok(())
     }
 
@@ -151,6 +223,11 @@ impl VideoDecoder for FfmpegDecoder {
             .as_mut()
             .ok_or_else(|| fluxbridge_core::CoreError::Other("decoder not configured".into()))?;
 
+        // scrcpy sends raw Annex-B H.264 NAL runs (one access unit per call).
+        // Feeding each access unit straight to the libav H264 decoder via
+        // Packet::copy is correct for Annex-B input: the h264 parser consumes
+        // the inline SPS/PPS that arrive with keyframes, so decoder extradata is
+        // not strictly required for this stream.
         let packet = ffmpeg_next::Packet::copy(encoded);
         decoder
             .send_packet(&packet)
@@ -170,32 +247,38 @@ impl VideoDecoder for FfmpegDecoder {
 
         let w = decoded.width();
         let h = decoded.height();
-        let scaler = self.scaler.get_or_insert_with(|| {
-            Scaler::get(
-                decoded.format(),
-                w,
-                h,
-                Pixel::RGBA,
-                w,
-                h,
-                Flags::BILINEAR,
-            )
-            .expect("create swscale context")
-        });
+        let src_format = decoded.format();
+
+        // (Re)build the swscale context whenever the decoded frame geometry or
+        // pixel format differs from what the cached scaler was built for. This
+        // is the mid-stream resolution-change path: a device rotation (or the
+        // Z Fold5 folding/unfolding) makes libav emit frames at a new w/h, and
+        // a scaler sized for the old geometry would produce an RGBA buffer
+        // whose pack_rgba length no longer equals the new width*height*4, so
+        // the UI length gate would silently drop every post-rotation frame
+        // (black/frozen video). Only the scaler is rebuilt here; the H264
+        // decoder is deliberately reused across re-configures.
+        if self.scaler_src != Some((w, h, src_format)) {
+            self.scaler = Some(
+                Scaler::get(src_format, w, h, Pixel::RGBA, w, h, Flags::BILINEAR).map_err(|e| {
+                    fluxbridge_core::CoreError::Other(format!("create swscale context: {e}"))
+                })?,
+            );
+            self.scaler_src = Some((w, h, src_format));
+        }
+        let scaler = self
+            .scaler
+            .as_mut()
+            .expect("scaler was just created above");
         let mut rgba = VideoFrame::empty();
         scaler
             .run(&decoded, &mut rgba)
             .map_err(|e| fluxbridge_core::CoreError::Other(format!("swscale: {e}")))?;
 
-        // Copy tightly packed RGBA (strip any row stride padding).
-        let stride = rgba.stride(0);
-        let row_bytes = (w * 4) as usize;
-        let src = rgba.data(0);
-        let mut data = Vec::with_capacity(row_bytes * h as usize);
-        for row in 0..h as usize {
-            let start = row * stride;
-            data.extend_from_slice(&src[start..start + row_bytes]);
-        }
+        // Copy tightly packed RGBA (strip any row stride padding) so the UI's
+        // data.len() == width*height*4 gate is satisfied. The row-packing math
+        // lives in the pure pack_rgba helper so it can be tested headless.
+        let data = pack_rgba(rgba.data(0), rgba.stride(0), w as usize, h as usize);
         Ok(DecodedFrame {
             width: w,
             height: h,
@@ -331,6 +414,92 @@ mod tests {
         assert_eq!(frames[0].data, vec![0, 1, 2]);
         assert_eq!(frames[2].data, vec![2, 3, 4]);
         assert_eq!(frames[0].pixel_format, "fake");
+    }
+
+    #[test]
+    fn pack_rgba_no_padding_is_identity() {
+        // src_stride == width*4: output should equal the input, byte for byte.
+        let width = 3;
+        let height = 2;
+        let stride = width * 4;
+        let src: Vec<u8> = (0..(stride * height) as u8).collect();
+        let out = pack_rgba(&src, stride, width, height);
+        assert_eq!(out.len(), width * height * 4);
+        assert_eq!(out, src, "no-padding pack must be the identity");
+    }
+
+    #[test]
+    fn pack_rgba_strips_row_padding() {
+        // src_stride > width*4: trailing padding bytes on each row are dropped.
+        let width = 2; // 2 px => 8 visible bytes per row
+        let height = 3;
+        let row_bytes = width * 4; // 8
+        let stride = row_bytes + 4; // 4 bytes of padding per row
+        let mut src = Vec::new();
+        for row in 0..height {
+            // Visible pixels: a distinct value per row so we can assert ordering.
+            for b in 0..row_bytes {
+                src.push((row * 10 + b) as u8);
+            }
+            // Padding bytes we must NOT see in the output.
+            src.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC]);
+        }
+        let out = pack_rgba(&src, stride, width, height);
+        assert_eq!(out.len(), width * height * 4);
+        // Expected is the concatenation of just the visible bytes, in row order.
+        let mut expected = Vec::new();
+        for row in 0..height {
+            for b in 0..row_bytes {
+                expected.push((row * 10 + b) as u8);
+            }
+        }
+        assert_eq!(out, expected, "padding must be stripped, rows kept in order");
+        assert!(
+            !out.contains(&0xFF) && !out.contains(&0xFE),
+            "padding bytes must not leak into the packed buffer"
+        );
+    }
+
+    #[test]
+    fn pack_rgba_one_by_one() {
+        // A single pixel with padding past it: exactly 4 bytes come out.
+        let src = vec![1, 2, 3, 4, 99, 99, 99, 99];
+        let out = pack_rgba(&src, 8, 1, 1);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pack_rgba_multi_row_ordering_unpadded() {
+        // 1px wide, 3 rows, no padding: verify top-to-bottom row ordering.
+        let src = vec![
+            10, 11, 12, 13, // row 0
+            20, 21, 22, 23, // row 1
+            30, 31, 32, 33, // row 2
+        ];
+        let out = pack_rgba(&src, 4, 1, 3);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pack_rgba_output_satisfies_ui_length_invariant() {
+        // Document the decoder -> UI contract: a DecodedFrame carrying a
+        // pack_rgba buffer has data.len() == width*height*4, which is exactly
+        // the length ui::decoded_frame_to_image requires to draw a frame.
+        let width = 5;
+        let height = 4;
+        let stride = width * 4 + 12; // some arbitrary padding
+        let src = vec![7u8; stride * height];
+        let frame = DecodedFrame {
+            width: width as u32,
+            height: height as u32,
+            pixel_format: "rgba".to_string(),
+            data: pack_rgba(&src, stride, width, height),
+        };
+        assert_eq!(frame.pixel_format, "rgba");
+        assert_eq!(
+            frame.data.len(),
+            (frame.width as usize) * (frame.height as usize) * 4
+        );
     }
 
     #[test]
