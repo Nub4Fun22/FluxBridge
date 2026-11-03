@@ -213,8 +213,10 @@ impl VideoDecoder for FfmpegDecoder {
         // stream_av_packets calls configure() twice with different intents:
         //   1. ONCE up front from the parsed scrcpy header with the real device
         //      dimensions set and empty extra_data; and
-        //   2. AGAIN for every is_config (SPS/PPS) access unit with width=0,
-        //      height=0 and extra_data=SPS/PPS.
+        //   2. AGAIN for the is_config (SPS/PPS) access unit with width=0,
+        //      height=0 and extra_data=SPS/PPS. That same config access unit is
+        //      ALSO fed through decode() so the SPS/PPS NALs reach send_packet
+        //      and prime the h264 parser (see the decode() note below).
         // Only remember non-zero dimensions so a later zero-dim SPS/PPS re-config
         // does not clobber the known-good header geometry. The decoded frame's
         // real geometry always comes from decoded.width()/height() in decode(),
@@ -225,9 +227,10 @@ impl VideoDecoder for FfmpegDecoder {
         }
 
         // If a working decoder already exists, do NOT tear it down on a
-        // re-configure. scrcpy sends raw Annex-B H.264, so SPS/PPS also arrive
-        // inline with each keyframe and the libav h264 parser picks them up from
-        // the stream itself; rebuilding the decoder (and dropping the scaler)
+        // re-configure. scrcpy sends raw Annex-B H.264 and its codec config
+        // (SPS/PPS) arrives ONCE up front as the leading config access unit,
+        // which stream_av_packets feeds through decode() to prime the libav
+        // h264 parser; rebuilding the decoder (and dropping the scaler)
         // mid-stream would needlessly discard warmed-up state. Build the decoder
         // lazily only the first time.
         if self.decoder.is_some() {
@@ -259,9 +262,14 @@ impl VideoDecoder for FfmpegDecoder {
 
         // scrcpy sends raw Annex-B H.264 NAL runs (one access unit per call).
         // Feeding each access unit straight to the libav H264 decoder via
-        // Packet::copy is correct for Annex-B input: the h264 parser consumes
-        // the inline SPS/PPS that arrive with keyframes, so decoder extradata is
-        // not strictly required for this stream.
+        // Packet::copy is correct for Annex-B input. scrcpy's codec config
+        // (SPS/PPS) is sent ONCE up front as the leading config access unit and
+        // is NOT re-inlined before each keyframe, so stream_av_packets feeds
+        // that config access unit through this same decode() path first: the
+        // SPS/PPS NALs go through send_packet and prime the h264 parser. A pure
+        // SPS/PPS access unit produces no frame, so receive_frame returns EAGAIN
+        // and we return the empty frame below (no error). Every later frame then
+        // decodes against the primed context.
         let packet = ffmpeg_next::Packet::copy(encoded);
         decoder
             .send_packet(&packet)
