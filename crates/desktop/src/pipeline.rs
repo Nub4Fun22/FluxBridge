@@ -2013,12 +2013,20 @@ mod tests {
         name[..6].copy_from_slice(b"SM-F94"); // non-zero first byte on purpose
         wire.extend_from_slice(&name);
         wire.extend_from_slice(&crate::scrcpy::fourcc(b"h264").to_be_bytes());
+        // scrcpy 5.0.1 inserts a 4-byte big-endian session-flags word
+        // (writeSessionMeta) BETWEEN the codec id and the width. Emit a
+        // distinctive non-zero value so a regression that drops the read would
+        // desync width/height and fail the assertions below.
+        wire.extend_from_slice(&0x8000_0000u32.to_be_bytes()); // session flags
         wire.extend_from_slice(&1080u32.to_be_bytes()); // width
         wire.extend_from_slice(&1920u32.to_be_bytes()); // height
                                                         // One access unit: 8-byte pts/flags header (key-frame flag set) + 4-byte
                                                         // length + payload. A non-config unit so it is decoded and forwarded.
         let payload = b"\x00\x00\x00\x01fakeNAL".to_vec();
-        let pts_flags: u64 = 1u64 << 62; // PACKET_FLAG_KEY_FRAME, not config
+        // In the scrcpy 5.0.1 bit layout the key-frame flag is bit 61 (bit 62
+        // is CONFIG). Set the key-frame bit so this is a decodable, non-config
+        // access unit that is forwarded to the sink.
+        let pts_flags: u64 = 1u64 << 61; // PACKET_FLAG_KEY_FRAME, not config
         wire.extend_from_slice(&pts_flags.to_be_bytes());
         wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         wire.extend_from_slice(&payload);
