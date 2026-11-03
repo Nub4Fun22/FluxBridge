@@ -139,6 +139,18 @@ impl VideoDecoder for StubDecoder {
 pub struct FfmpegDecoder {
     decoder: Option<ffmpeg_next::decoder::Video>,
     scaler: Option<ffmpeg_next::software::scaling::Context>,
+    /// The (width, height, pixel format) the cached `scaler` was built for.
+    ///
+    /// swscale contexts are created for a fixed source geometry and pixel
+    /// format. A phone mirror can change geometry mid-stream (device rotation,
+    /// or the Z Fold5 folding/unfolding), after which libav emits frames at the
+    /// NEW dimensions. If we kept a scaler built for the old geometry, its RGBA
+    /// output (and `pack_rgba`'s width*height*4 result) would no longer match
+    /// the frame the UI expects and every post-change frame would be dropped by
+    /// the UI length gate (black/frozen video). We compare each decoded frame's
+    /// geometry to this and rebuild the scaler when it differs. The H264
+    /// decoder itself is NOT rebuilt; only the scaler follows the frame.
+    scaler_src: Option<(u32, u32, ffmpeg_next::format::Pixel)>,
     width: u32,
     height: u32,
 }
@@ -152,6 +164,7 @@ impl FfmpegDecoder {
         Ok(FfmpegDecoder {
             decoder: None,
             scaler: None,
+            scaler_src: None,
             width: 0,
             height: 0,
         })
@@ -196,6 +209,7 @@ impl VideoDecoder for FfmpegDecoder {
             .map_err(|e| fluxbridge_core::CoreError::Other(format!("open h264 decoder: {e}")))?;
         self.decoder = Some(decoder);
         self.scaler = None;
+        self.scaler_src = None;
         Ok(())
     }
 
@@ -233,18 +247,29 @@ impl VideoDecoder for FfmpegDecoder {
 
         let w = decoded.width();
         let h = decoded.height();
-        let scaler = self.scaler.get_or_insert_with(|| {
-            Scaler::get(
-                decoded.format(),
-                w,
-                h,
-                Pixel::RGBA,
-                w,
-                h,
-                Flags::BILINEAR,
-            )
-            .expect("create swscale context")
-        });
+        let src_format = decoded.format();
+
+        // (Re)build the swscale context whenever the decoded frame geometry or
+        // pixel format differs from what the cached scaler was built for. This
+        // is the mid-stream resolution-change path: a device rotation (or the
+        // Z Fold5 folding/unfolding) makes libav emit frames at a new w/h, and
+        // a scaler sized for the old geometry would produce an RGBA buffer
+        // whose pack_rgba length no longer equals the new width*height*4, so
+        // the UI length gate would silently drop every post-rotation frame
+        // (black/frozen video). Only the scaler is rebuilt here; the H264
+        // decoder is deliberately reused across re-configures.
+        if self.scaler_src != Some((w, h, src_format)) {
+            self.scaler = Some(
+                Scaler::get(src_format, w, h, Pixel::RGBA, w, h, Flags::BILINEAR).map_err(|e| {
+                    fluxbridge_core::CoreError::Other(format!("create swscale context: {e}"))
+                })?,
+            );
+            self.scaler_src = Some((w, h, src_format));
+        }
+        let scaler = self
+            .scaler
+            .as_mut()
+            .expect("scaler was just created above");
         let mut rgba = VideoFrame::empty();
         scaler
             .run(&decoded, &mut rgba)

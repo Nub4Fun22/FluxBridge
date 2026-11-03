@@ -296,9 +296,11 @@ which needs the libav development libraries at build time and the matching
 shared-build runtime DLLs at run time.
 
 **In the shipped Windows release** (`.github/workflows/release.yml`) this is
-provisioned automatically. The release job downloads the gyan.dev prebuilt
-shared build (`ffmpeg-release-full-shared.7z`, FFmpeg 7.x, matching
-`ffmpeg-next` 7.1.0), normalizes it into a stable `ffmpeg` directory, and
+provisioned automatically. The release job downloads a version-PINNED prebuilt
+shared build (the BtbN FFmpeg-Builds asset
+`ffmpeg-n7.1.3-...-win64-gpl-shared-7.1.zip`, FFmpeg 7.1.3, matching
+`ffmpeg-next` 7.1.0) from an immutable dated-tag URL and verifies its SHA256
+before use, normalizes it into a stable `ffmpeg` directory, and
 exports `FFMPEG_DIR` (so `ffmpeg-next` finds the headers and import libraries)
 and `LIBCLANG_PATH` (Visual Studio's bundled LLVM, needed because
 `ffmpeg-sys-next` runs bindgen/libclang). It then builds with

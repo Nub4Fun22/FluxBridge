@@ -72,20 +72,40 @@ jobs:
       #     it needs both an FFmpeg dev tree (FFMPEG_DIR) and libclang
       #     (LIBCLANG_PATH). This mirrors the ffmpeg-next maintainer's own
       #     Windows CI: set LIBCLANG_PATH from Visual Studio's bundled LLVM
-      #     (found via vswhere) and download the gyan.dev
-      #     ffmpeg-release-full-shared build (FFmpeg 7.x, matching ffmpeg-next
-      #     7.1.0). Because it is a SHARED build the avcodec/avformat/avutil/
-      #     swscale/swresample (plus avfilter/avdevice/postproc) DLLs it ships
-      #     in ffmpeg\bin MUST travel next to fluxbridge-desktop.exe at runtime
+      #     (found via vswhere) and download a prebuilt SHARED FFmpeg build.
+      #
+      #     PINNED FFmpeg 7.x.  The crate is ffmpeg-next 7.1.0 (ffmpeg-sys-next
+      #     7.x), whose generated bindings target the FFmpeg 7 ABI. A rolling
+      #     "latest" download (the old gyan.dev ffmpeg-release-full-shared.7z)
+      #     could advance to FFmpeg 8.x and break this release with no code
+      #     change, or worse link against DLLs with changed symbols. So we pin a
+      #     SPECIFIC, immutable BtbN FFmpeg-Builds asset: the dated autobuild
+      #     tag `autobuild-2026-01-31-12-57` publishes
+      #     ffmpeg-n7.1.3-35-g419cdf9dcc-win64-gpl-shared-7.1.zip, a FFmpeg
+      #     7.1.3 shared build. That per-release URL never changes, so the build
+      #     is reproducible. MAINTAINER NOTE: this pin MUST stay on an FFmpeg 7.x
+      #     shared build for as long as the crate is ffmpeg-next 7. When bumping
+      #     ffmpeg-next to 8, pick a matching FFmpeg 8.x asset and update BOTH
+      #     the URL and the FFMPEG_SHA256 below.
+      #
+      #     Because it is a SHARED build the avcodec/avformat/avutil/swscale/
+      #     swresample (plus avfilter/avdevice/postproc) DLLs it ships in
+      #     ffmpeg\bin MUST travel next to fluxbridge-desktop.exe at runtime
       #     (staged into target\release by a later step), or the app will not
       #     start. The extracted folder is versioned (ffmpeg-*), so it is
       #     normalized into a stable `ffmpeg` directory to keep FFMPEG_DIR and
-      #     the bin\ PATH entry deterministic. The guard fails the job early -
+      #     the bin\ PATH entry deterministic. The guards fail the job early -
       #     in the same defensive style as the scrcpy jar validation below - if
-      #     the download or extraction did not produce a usable ffmpeg\bin with
-      #     avcodec*.dll.
+      #     the download failed, the SHA256 did not match, or the extraction did
+      #     not produce a usable ffmpeg\bin with avcodec*.dll.
       - name: Provision FFmpeg (shared) for the decode feature
         shell: pwsh
+        env:
+          # Immutable, version-pinned FFmpeg 7.1.3 shared build (keep on 7.x
+          # while the crate is ffmpeg-next 7). SHA256 verified out-of-band from
+          # the GitHub release asset digest; a mismatch fails the job.
+          FFMPEG_URL: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-01-31-12-57/ffmpeg-n7.1.3-35-g419cdf9dcc-win64-gpl-shared-7.1.zip"
+          FFMPEG_SHA256: "631bf2d50ef663befe3fd50ce864678483283ce0af9c26d5d91f6d0ff4f77b4c"
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -100,20 +120,30 @@ jobs:
             throw "libclang.dll not found under '$libclangPath'. The VS bundled LLVM component is required for ffmpeg-sys-next bindgen."
           }
 
-          # Download and extract the gyan.dev prebuilt SHARED FFmpeg build.
+          # Download the PINNED SHARED FFmpeg build (versioned, immutable URL).
           $ffmpegRoot = "$env:RUNNER_TEMP\ffmpeg-dl"
           New-Item -ItemType Directory -Force -Path $ffmpegRoot | Out-Null
-          $archive = Join-Path $ffmpegRoot "ffmpeg-release-full-shared.7z"
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" `
-            -OutFile $archive
+          $archive = Join-Path $ffmpegRoot "ffmpeg-shared.zip"
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $archive
           if (-not (Test-Path $archive)) {
-            throw "FFmpeg download failed: ffmpeg-release-full-shared.7z was not written to $archive."
+            throw "FFmpeg download failed: the pinned archive was not written to $archive."
           }
 
-          # windows-latest ships 7z (7z.exe) preinstalled.
-          7z x $archive "-o$ffmpegRoot" -y | Out-Null
+          # Verify the SHA256 of the pinned asset BEFORE extracting, in the same
+          # defensive style as the scrcpy-jar checksum validation below. This
+          # turns a tampered/corrupt download into a hard, early failure instead
+          # of a mysterious link error or a broken shipped build.
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLower()
+          $expected = $env:FFMPEG_SHA256.ToLower()
+          if ($actual -ne $expected) {
+            throw "FFmpeg checksum mismatch: expected $expected but downloaded archive is $actual. Refusing to build against an unverified FFmpeg."
+          }
+          Write-Host "FFmpeg archive SHA256 verified: $actual."
 
-          # Normalize the versioned extracted dir (ffmpeg-*-full_build-shared)
+          # BtbN ships a .zip; Expand-Archive is native PowerShell.
+          Expand-Archive -Path $archive -DestinationPath $ffmpegRoot -Force
+
+          # Normalize the versioned extracted dir (ffmpeg-n7.1.3-*-shared-7.1)
           # into a stable `ffmpeg` directory so FFMPEG_DIR is deterministic.
           $ffmpegDir = Join-Path $ffmpegRoot "ffmpeg"
           if (Test-Path $ffmpegDir) { Remove-Item -Recurse -Force $ffmpegDir }
